@@ -1,0 +1,9 @@
+[package]
+name = "payya-vector-db"
+description = "Vector database with HNSW index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,9 @@
+[package]
+name = "payya-reasoner"
+description = "Reasoner with Chain of Thought implementation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

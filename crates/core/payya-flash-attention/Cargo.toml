@@ -1,0 +1,9 @@
+[package]
+name = "payya-flash-attention"
+description = "Flash Attention kernel (CUDA-compatible)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

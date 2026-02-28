@@ -1,0 +1,147 @@
+[workspace]
+resolver = "2"
+members = [
+    # ── Core Primitives ──────────────────────────────────────────────
+    "crates/core/payya-autograd",
+    "crates/core/payya-matmul",
+    "crates/core/payya-softmax",
+    "crates/core/payya-logit-processor",
+    "crates/core/payya-tokenizer",
+    "crates/core/payya-flash-attention",
+
+    # ── Model Architectures ──────────────────────────────────────────
+    "crates/models/payya-transformer",
+    "crates/models/payya-vit",
+    "crates/models/payya-ssm",
+    "crates/models/payya-moe",
+    "crates/models/payya-clip",
+    "crates/models/payya-diffusion",
+    "crates/models/payya-audio-spectrogram",
+    "crates/models/payya-slm",
+    "crates/models/payya-embedding",
+
+    # ── Training ─────────────────────────────────────────────────────
+    "crates/training/payya-distributed",
+    "crates/training/payya-lora",
+    "crates/training/payya-peft",
+    "crates/training/payya-rlhf",
+    "crates/training/payya-dpo",
+    "crates/training/payya-distillation",
+    "crates/training/payya-nas",
+
+    # ── Inference & Serving ──────────────────────────────────────────
+    "crates/inference/payya-server",
+    "crates/inference/payya-kv-cache",
+    "crates/inference/payya-speculative",
+    "crates/inference/payya-quantization",
+    "crates/inference/payya-prompt-cache",
+
+    # ── Agent & Reasoning ────────────────────────────────────────────
+    "crates/agent/payya-reasoner",
+    "crates/agent/payya-agent",
+    "crates/agent/payya-function-call",
+    "crates/agent/payya-semantic-router",
+    "crates/agent/payya-code-interpreter",
+    "crates/agent/payya-structured-output",
+
+    # ── Data & Retrieval ─────────────────────────────────────────────
+    "crates/data/payya-vector-db",
+    "crates/data/payya-rag",
+    "crates/data/payya-graph-rag",
+    "crates/data/payya-knowledge-graph",
+    "crates/data/payya-feature-store",
+    "crates/data/payya-data-curation",
+    "crates/data/payya-synthetic-data",
+    "crates/data/payya-text-to-sql",
+    "crates/data/payya-recommendation",
+    "crates/data/payya-db-driver",
+
+    # ── Safety & Evaluation ──────────────────────────────────────────
+    "crates/safety/payya-guardrails",
+    "crates/safety/payya-eval",
+    "crates/safety/payya-adversarial",
+    "crates/safety/payya-interpretability",
+
+    # ── Speech & Audio ───────────────────────────────────────────────
+    "crates/speech/payya-asr",
+    "crates/speech/payya-tts",
+
+    # ── Infrastructure ───────────────────────────────────────────────
+    "crates/infra/payya-gateway",
+    "crates/infra/payya-model-merger",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Ignoramuss/payya"
+
+[workspace.dependencies]
+# Shared dependencies across crates
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+rand = "0.8"
+ndarray = "0.16"
+rayon = "1"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+
+# Internal crate dependencies (workspace members reference each other)
+payya-autograd = { path = "crates/core/payya-autograd" }
+payya-matmul = { path = "crates/core/payya-matmul" }
+payya-softmax = { path = "crates/core/payya-softmax" }
+payya-logit-processor = { path = "crates/core/payya-logit-processor" }
+payya-tokenizer = { path = "crates/core/payya-tokenizer" }
+payya-flash-attention = { path = "crates/core/payya-flash-attention" }
+payya-transformer = { path = "crates/models/payya-transformer" }
+payya-vit = { path = "crates/models/payya-vit" }
+payya-ssm = { path = "crates/models/payya-ssm" }
+payya-moe = { path = "crates/models/payya-moe" }
+payya-clip = { path = "crates/models/payya-clip" }
+payya-diffusion = { path = "crates/models/payya-diffusion" }
+payya-audio-spectrogram = { path = "crates/models/payya-audio-spectrogram" }
+payya-slm = { path = "crates/models/payya-slm" }
+payya-embedding = { path = "crates/models/payya-embedding" }
+payya-distributed = { path = "crates/training/payya-distributed" }
+payya-lora = { path = "crates/training/payya-lora" }
+payya-peft = { path = "crates/training/payya-peft" }
+payya-rlhf = { path = "crates/training/payya-rlhf" }
+payya-dpo = { path = "crates/training/payya-dpo" }
+payya-distillation = { path = "crates/training/payya-distillation" }
+payya-nas = { path = "crates/training/payya-nas" }
+payya-server = { path = "crates/inference/payya-server" }
+payya-kv-cache = { path = "crates/inference/payya-kv-cache" }
+payya-speculative = { path = "crates/inference/payya-speculative" }
+payya-quantization = { path = "crates/inference/payya-quantization" }
+payya-prompt-cache = { path = "crates/inference/payya-prompt-cache" }
+payya-reasoner = { path = "crates/agent/payya-reasoner" }
+payya-agent = { path = "crates/agent/payya-agent" }
+payya-function-call = { path = "crates/agent/payya-function-call" }
+payya-semantic-router = { path = "crates/agent/payya-semantic-router" }
+payya-code-interpreter = { path = "crates/agent/payya-code-interpreter" }
+payya-structured-output = { path = "crates/agent/payya-structured-output" }
+payya-vector-db = { path = "crates/data/payya-vector-db" }
+payya-rag = { path = "crates/data/payya-rag" }
+payya-graph-rag = { path = "crates/data/payya-graph-rag" }
+payya-knowledge-graph = { path = "crates/data/payya-knowledge-graph" }
+payya-feature-store = { path = "crates/data/payya-feature-store" }
+payya-data-curation = { path = "crates/data/payya-data-curation" }
+payya-synthetic-data = { path = "crates/data/payya-synthetic-data" }
+payya-text-to-sql = { path = "crates/data/payya-text-to-sql" }
+payya-recommendation = { path = "crates/data/payya-recommendation" }
+payya-db-driver = { path = "crates/data/payya-db-driver" }
+payya-guardrails = { path = "crates/safety/payya-guardrails" }
+payya-eval = { path = "crates/safety/payya-eval" }
+payya-adversarial = { path = "crates/safety/payya-adversarial" }
+payya-interpretability = { path = "crates/safety/payya-interpretability" }
+payya-asr = { path = "crates/speech/payya-asr" }
+payya-tts = { path = "crates/speech/payya-tts" }
+payya-gateway = { path = "crates/infra/payya-gateway" }
+payya-model-merger = { path = "crates/infra/payya-model-merger" }

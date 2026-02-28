@@ -1,0 +1,9 @@
+[package]
+name = "payya-logit-processor"
+description = "Logit processing and sampling strategies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
