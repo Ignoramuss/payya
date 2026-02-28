@@ -5,8 +5,5 @@
 #[cfg(test)]
 mod tests {
     #[test]
-    fn it_works() {
-        // TODO: implement
-        assert!(true);
-    }
+    fn it_works() {}
 }
