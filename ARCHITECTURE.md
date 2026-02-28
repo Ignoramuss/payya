@@ -253,6 +253,210 @@ payya-gateway      →  payya-server
 
 ---
 
+## Implemented Feature Architectures
+
+This section contains detailed architecture diagrams for every implemented
+feature. Each diagram shows the internal structure, data flow, and key
+invariants of the crate. Updated as each milestone lands.
+
+---
+
+### M1: `payya-matmul` — Tiled GEMM
+
+Computes C = A × B for row-major `f32` matrices. Two execution paths,
+selected deterministically by matrix dimensions (not by error/fallback):
+
+```
+         ┌─────────────────────────────────────┐
+         │           matmul(a, b, m, k, n)      │
+         │                                       │
+         │  assert!(a.len() >= m*k)   ◄── invariant: no silent truncation
+         │  assert!(b.len() >= k*n)              │
+         │                                       │
+         │  ┌──────────────────────┐             │
+         │  │ m,k,n all <= TILE?   │             │
+         │  └──────┬───────┬───────┘             │
+         │     yes │       │ no                  │
+         │         ▼       ▼                     │
+         │   naive_matmul  tiled_matmul          │
+         │   (ikj loops)   (blocked ikj)         │
+         │         │       │                     │
+         │         └───┬───┘                     │
+         │             ▼                         │
+         │     C[i*n+j] += A[i*k+p] * B[p*n+j]  │
+         └─────────────────────────────────────┘
+
+   Both paths compute the identical result (same algorithm, same
+   accumulation order within each tile). The tiled path is not a
+   "fallback" — it is the primary path for large matrices.
+```
+
+**Tiling scheme** — chosen so three tile blocks fit in L1 cache:
+
+```
+   A (m×k)              B (k×n)              C (m×n)
+  ┌──┬──┬──┐          ┌──┬──┬──┐          ┌──┬──┬──┐
+  │  │  │  │          │  │  │  │          │  │  │  │
+  ├──┼──┼──┤          ├──┼──┼──┤          ├──┼──┼──┤
+  │  │▓▓│  │ A tile   │  │  │  │          │  │  │▓▓│ C tile
+  ├──┼──┼──┤ (i0..i1, ├──┼──┼──┤          ├──┼──┼──┤ (i0..i1,
+  │  │  │  │  p0..p1) │▓▓│  │  │ B tile   │  │  │  │  j0..j1)
+  └──┴──┴──┘          └──┴──┴──┘ (p0..p1, └──┴──┴──┘
+                                   j0..j1)
+
+   TILE = 32  →  3 tiles × 32×32 × 4 bytes = 12 KB (fits L1)
+
+   Loop order: p-tiles outermost (reduction dimension),
+   then i-tiles, then j-tiles. This maximises register reuse
+   of the C-tile accumulator across p-iterations.
+```
+
+**Transposed variants** for autograd backward pass:
+
+```
+   matmul_at_b(A, B, C, m, k, n)     matmul_a_bt(A, B, C, m, k, n)
+   ─────────────────────────────      ─────────────────────────────
+   A stored as (k×m), read as Aᵀ     B stored as (n×k), read as Bᵀ
+   C += Aᵀ × B                       C += A × Bᵀ
+
+   Used by autograd backward:
+     ∂L/∂A = ∂L/∂C × Bᵀ  (matmul_a_bt)
+     ∂L/∂B = Aᵀ × ∂L/∂C  (matmul_at_b)
+```
+
+---
+
+### M1: `payya-autograd` — Reverse-Mode Automatic Differentiation
+
+Arena-based computation graph. Tensors are indices (`TensorId`) into a
+`Vec<Node>` owned by the `Graph`. No `Rc<RefCell<>>`, no garbage collection.
+
+```
+   ┌──────────────────────────────────────────────────────┐
+   │                      Graph                            │
+   │                                                       │
+   │  nodes: Vec<Node>                                     │
+   │  ┌─────┬─────┬─────┬─────┬─────┬─────┐              │
+   │  │  0  │  1  │  2  │  3  │  4  │  5  │  ...         │
+   │  │Leaf │Leaf │ Add │MatMul│ReLU │ Sum │              │
+   │  │(x)  │(W)  │(0,1)│(2,.) │(3)  │(4)  │              │
+   │  └──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴──┬──┘              │
+   │     │     │     │     │     │     │                   │
+   │  TensorId is just an index ───────────────────────►  │
+   │  into this arena. Cheap to copy (usize wrapper).     │
+   └──────────────────────────────────────────────────────┘
+```
+
+**Node structure:**
+
+```
+   Node {
+       data: Vec<f32>         ◄── forward-pass result
+       shape: Vec<usize>      ◄── dimensions (row-major)
+       grad: Option<Vec<f32>> ◄── populated by backward()
+       op: Op                 ◄── which operation + input TensorIds
+       requires_grad: bool    ◄── param (true) vs constant (false)
+   }
+```
+
+**Forward pass** — each operation reads its inputs, computes the result,
+and appends a new `Node` to the arena. Because nodes are append-only,
+the arena index IS the topological order:
+
+```
+   User code                          Graph arena
+   ─────────                          ───────────
+   let x = g.param(data, shape)  →   nodes[0] = Leaf(x)
+   let w = g.param(data, shape)  →   nodes[1] = Leaf(w)
+   let h = g.matmul(x, w)       →   nodes[2] = MatMul(0, 1)
+   let h = g.relu(h)            →   nodes[3] = Relu(2)
+   let loss = g.sum(h)          →   nodes[4] = Sum(3)
+
+   Invariant: node i can only reference nodes j where j < i.
+   This means the arena is always in valid topological order.
+```
+
+**Backward pass** — reverse iteration over the arena propagates
+gradients. No explicit topological sort is needed:
+
+```
+   backward(root=4):
+
+   idx=4  Sum(3)      grad[4] = [1.0]        (seed)
+          ──────►     grad[3] += [1.0, 1.0, ...]   (broadcast)
+
+   idx=3  Relu(2)     grad[3] = [1.0, 0.0, 1.0, ...]
+          ──────►     grad[2] += grad[3] * (input > 0 ? 1 : 0)
+
+   idx=2  MatMul(0,1) grad[2] = [...]
+          ──────►     grad[0] += grad[2] × W^T    (matmul_a_bt)
+                      grad[1] += X^T × grad[2]    (matmul_at_b)
+
+   idx=1  Leaf(w)     grad[1] = accumulated       (done — read via g.grad(w))
+   idx=0  Leaf(x)     grad[0] = accumulated       (done — read via g.grad(x))
+```
+
+**Broadcasting** — handled in both forward and backward for binary ops:
+
+```
+   Forward: (m,n) + (n,)  →  broadcast b across rows  →  (m,n)
+
+   Backward of broadcast add:
+     grad_a = grad_output                          (same shape)
+     grad_b = sum_over_rows(grad_output)           (reduce back)
+
+   Supported patterns:
+     same shape    →  element-wise
+     scalar (1,)   →  broadcast to any shape
+     row (n,)      →  broadcast across rows of (m,n)
+```
+
+**Supported operations and their gradients:**
+
+```
+   ┌────────────┬───────────────────────┬────────────────────────────────┐
+   │ Operation  │ Forward               │ Backward (∂L/∂input)          │
+   ├────────────┼───────────────────────┼────────────────────────────────┤
+   │ add(a, b)  │ a + b                 │ ∂L/∂a = grad, ∂L/∂b = grad   │
+   │ sub(a, b)  │ a - b                 │ ∂L/∂a = grad, ∂L/∂b = -grad  │
+   │ mul(a, b)  │ a * b                 │ ∂L/∂a = grad*b, ∂L/∂b = grad*a│
+   │ matmul(a,b)│ a @ b                 │ ∂L/∂a = grad@bᵀ, ∂L/∂b = aᵀ@grad│
+   │ relu(a)    │ max(0, a)             │ grad * (a > 0 ? 1 : 0)       │
+   │ sigmoid(a) │ σ(a)                  │ grad * σ(a) * (1 - σ(a))     │
+   │ log(a)     │ ln(a)                 │ grad / a                      │
+   │ exp(a)     │ eᵃ                    │ grad * eᵃ                     │
+   │ sum(a)     │ Σaᵢ                   │ broadcast grad to input shape │
+   │ reshape(a) │ same data, new shape  │ same grad, original shape     │
+   │ transpose(a)│ swap rows/cols       │ transpose(grad)               │
+   └────────────┴───────────────────────┴────────────────────────────────┘
+
+   All gradients validated against finite-difference numerical gradients.
+```
+
+**MLP training loop** (demonstrated in `examples/xor_mlp.rs`):
+
+```
+   ┌─────────────────────────────────────────────┐
+   │              Training Epoch                   │
+   │                                               │
+   │  1. Build graph   x ─┬─► matmul ─► add ─► relu ─► matmul ─► add ─► sigmoid ─► sub ─► mul ─► sum
+   │                   W₁─┘          b₁              W₂          b₂              target     (diff²) (loss)
+   │                                               │
+   │  2. Forward       Compute all node data       │
+   │                   (happens during build)      │
+   │                                               │
+   │  3. Backward      g.backward(loss)            │
+   │                   → gradients on W₁,b₁,W₂,b₂ │
+   │                                               │
+   │  4. SGD update    W -= lr * ∂L/∂W             │
+   │                                               │
+   │  5. New epoch     Rebuild graph from scratch   │
+   │                   (old graph dropped)          │
+   └─────────────────────────────────────────────┘
+```
+
+---
+
 ## Suggested Implementation Order
 
 Work bottom-up through the layers for the smoothest experience:
