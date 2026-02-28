@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run rustfmt on staged Rust files.
+# Install: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+# Check if any .rs files are staged
+STAGED_RS=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
+
+if [ -z "$STAGED_RS" ]; then
+    exit 0
+fi
+
+echo "Running rustfmt on staged files..."
+
+# Check formatting (don't rewrite, just fail if not formatted)
+if ! cargo fmt --all -- --check 2>/dev/null; then
+    echo ""
+    echo "Formatting check failed. Run 'cargo fmt --all' to fix."
+    exit 1
+fi
+
+echo "Formatting check passed."
