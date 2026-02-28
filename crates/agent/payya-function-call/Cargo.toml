@@ -1,0 +1,9 @@
+[package]
+name = "payya-function-call"
+description = "Function calling router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

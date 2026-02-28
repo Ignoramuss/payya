@@ -1,0 +1,9 @@
+[package]
+name = "payya-distributed"
+description = "Distributed training loop (FSDP/Tensor Parallelism)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,9 @@
+[package]
+name = "payya-structured-output"
+description = "Structured output parser (Context Free Grammars)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
