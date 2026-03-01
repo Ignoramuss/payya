@@ -455,6 +455,148 @@ gradients. No explicit topological sort is needed:
    └─────────────────────────────────────────────┘
 ```
 
+### M2: `payya-tokenizer` — Byte-Pair Encoding (BPE) Tokenizer
+
+Trains, encodes, and decodes text using byte-pair encoding. Supports
+loading GPT-2 vocabulary files for compatibility testing.
+
+**Core data structures:**
+
+```
+   ┌─────────────────────────────────────────────────────────┐
+   │                     Tokenizer                            │
+   │                                                          │
+   │  merges: Vec<MergeRule>     ◄── merge rules in priority  │
+   │                                 order (index 0 = first)  │
+   │                                                          │
+   │  merge_map: HashMap<(TokenId, TokenId), TokenId>         │
+   │                             ◄── O(1) pair→merged lookup  │
+   │                                 (rebuilt from merges)    │
+   │                                                          │
+   │  vocab: HashMap<TokenId, Vec<u8>>                        │
+   │                             ◄── token ID → byte sequence │
+   │                                 for decoding             │
+   └─────────────────────────────────────────────────────────┘
+
+   MergeRule { left: TokenId, right: TokenId, merged: TokenId }
+   TokenId = u32  (0–255 = raw bytes, ≥256 = learned merges)
+```
+
+**Training algorithm:**
+
+```
+   Input corpus (bytes)
+   ┌──────────────────────────────────────────┐
+   │  "aaabdaaabac"                            │
+   │   → [97, 97, 97, 98, 100, 97, 97, 97,   │
+   │       98, 97, 99]                         │
+   └──────────────────┬───────────────────────┘
+                      │
+                      ▼
+   ┌──────────────────────────────────────────┐
+   │  While num_merges < target:              │
+   │                                           │
+   │  1. Count all adjacent pairs              │
+   │     {(97,97): 4, (97,98): 2, ...}        │
+   │                                           │
+   │  2. Find most frequent pair               │
+   │     → (97, 97) with count 4              │
+   │                                           │
+   │  3. Create merge rule:                    │
+   │     MergeRule { left:97, right:97,        │
+   │                 merged: 256 }             │
+   │                                           │
+   │  4. Apply merge in token sequence:        │
+   │     [97,97,97,98,...] → [256,97,98,...]   │
+   │                                           │
+   │  5. Repeat with next_id++                 │
+   └──────────────────────────────────────────┘
+
+   Invariant: merges stop early if no pair appears ≥2 times
+   (further merges would not compress).
+
+   Determinism: ties broken by smallest (left, right) pair.
+```
+
+**Encoding (text → token IDs):**
+
+```
+   Input: "abc"
+   ┌────────────────────────────────────────┐
+   │  1. Byte-level tokenization:           │
+   │     "abc" → [97, 98, 99]              │
+   │                                        │
+   │  2. Apply merges in priority order:    │
+   │     merge 0: (97,98)→256              │
+   │       [97, 98, 99] → [256, 99]        │
+   │     merge 1: (256,99)→257             │
+   │       [256, 99] → [257]               │
+   │                                        │
+   │  3. Output: [257]                      │
+   └────────────────────────────────────────┘
+
+   Each merge pass is a single linear scan: O(n) per merge.
+   Total encoding: O(n × num_merges).
+```
+
+**Decoding (token IDs → text):**
+
+```
+   Input: [257]
+   ┌────────────────────────────────────────┐
+   │  1. Look up each ID in vocab:          │
+   │     257 → [97, 98, 99]  (from merges) │
+   │                                        │
+   │  2. Concatenate byte sequences:        │
+   │     [97, 98, 99]                       │
+   │                                        │
+   │  3. UTF-8 decode (lossy):              │
+   │     → "abc"                            │
+   └────────────────────────────────────────┘
+```
+
+**GPT-2 compatibility layer:**
+
+```
+   GPT-2 uses a byte-to-unicode mapping so that all tokens
+   are printable strings. Non-printable bytes (0–32, 127–160,
+   173) are mapped to Unicode code points starting at U+0100.
+
+   Byte 0x00 → 'Ā' (U+0100)
+   Byte 0x20 → 'Ġ' (U+0120)    ◄── space character
+   Byte 0x41 → 'A' (U+0041)    ◄── printable: identity map
+
+   Loading GPT-2 vocab:
+   ┌────────────────────┐     ┌────────────────────┐
+   │   vocab.json       │     │   merges.txt       │
+   │   {"Ġ": 220,       │     │   #version: 0.2    │
+   │    "Ġt": 256, ...} │     │   Ġ t              │
+   └────────┬───────────┘     │   e r              │
+            │                 │   ...               │
+            ▼                 └────────┬───────────┘
+   ┌─────────────────────────────────┐ │
+   │  1. Parse vocab JSON → str→id  │ │
+   │  2. Build byte-to-unicode map  │ │
+   │  3. Convert token strings to   │◄┘
+   │     byte sequences via map     │
+   │  4. Parse merge lines into     │
+   │     MergeRule { left, right,   │
+   │     merged }                   │
+   └─────────────────────────────────┘
+
+   Invariant: byte-to-unicode map is bijective (256 unique
+   chars for 256 bytes). Verified in tests.
+```
+
+**Key invariants:**
+
+- `decode(encode(text)) == text` for all valid UTF-8 input.
+- Token IDs 0–255 always represent raw bytes.
+- Merge rules are topologically ordered: a merge at index i
+  only references tokens that exist after merges 0..i-1.
+- Training is deterministic: same corpus + vocab_size always
+  produces the same merge rules.
+
 ---
 
 ## Suggested Implementation Order
