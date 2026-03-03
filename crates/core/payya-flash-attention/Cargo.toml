@@ -1,9 +1,14 @@
 [package]
 name = "payya-flash-attention"
-description = "Flash Attention kernel (CUDA-compatible)"
+description = "Flash Attention kernel (tiled, IO-aware) for CPU"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+payya-softmax = { workspace = true }
+
+[dev-dependencies]
+payya-matmul = { workspace = true }
+rand = { workspace = true }

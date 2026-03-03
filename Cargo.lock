@@ -108,6 +108,11 @@ version = "0.1.0"
 [[package]]
 name = "payya-flash-attention"
 version = "0.1.0"
+dependencies = [
+ "payya-matmul",
+ "payya-softmax",
+ "rand",
+]
 
 [[package]]
 name = "payya-function-call"

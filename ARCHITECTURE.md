@@ -599,6 +599,159 @@ loading GPT-2 vocabulary files for compatibility testing.
 
 ---
 
+### M3: `payya-softmax` — Numerically Stable Softmax
+
+Provides both standard two-pass and single-pass online softmax.
+The online variant uses the running-max correction trick to compute
+softmax without a separate pass to find the maximum.
+
+```
+   ┌─────────────────────────────────────────────────────────┐
+   │               softmax(logits)                            │
+   │               Two-pass algorithm                         │
+   │                                                          │
+   │  Pass 1: max = max(logits)                              │
+   │  Pass 2: out_i = exp(logits_i - max)                    │
+   │          sum = Σ out_i                                   │
+   │          out_i /= sum                                    │
+   └─────────────────────────────────────────────────────────┘
+
+   ┌─────────────────────────────────────────────────────────┐
+   │           softmax_online(logits)                         │
+   │           Single-pass (Milakov & Gimelshein, 2018)       │
+   │                                                          │
+   │  Initialize: m = -∞, d = 0                              │
+   │                                                          │
+   │  For each x_i:                                           │
+   │    m_prev = m                                            │
+   │    m = max(m, x_i)                                       │
+   │    d = d * exp(m_prev - m) + exp(x_i - m)  ◄── correct  │
+   │                                                 previous │
+   │                                                 sum for  │
+   │                                                 new max  │
+   │  Output: out_i = exp(x_i - m) / d                       │
+   └─────────────────────────────────────────────────────────┘
+
+   Both algorithms produce identical results in exact arithmetic.
+   In f32, they agree within epsilon.
+```
+
+**Backward pass (Jacobian-vector product):**
+
+```
+   Given: s = softmax(x), upstream gradient g = ∂L/∂s
+
+   ∂L/∂x_i = s_i * (g_i - dot(g, s))
+
+   Derived from Jacobian: ∂s_j/∂x_i = s_j * (δ_ij - s_i)
+
+   ┌────────────────────────────────────────────┐
+   │  softmax_backward(s, grad_output)           │
+   │                                             │
+   │  dot = Σ (s_i * grad_output_i)              │
+   │  grad_input_i = s_i * (grad_output_i - dot) │
+   └────────────────────────────────────────────┘
+
+   Row-wise variant: apply independently per row of (rows, cols).
+```
+
+**Key invariants:**
+
+- `sum(softmax(x)) == 1.0` within f32 epsilon for any non-empty input.
+- Numerically stable: no overflow for inputs up to ±1000.
+- Online and standard variants produce matching results.
+- All outputs are non-negative.
+- Backward validated against finite-difference numerical gradients.
+
+---
+
+### M3: `payya-flash-attention` — Tiled, IO-Aware Attention
+
+Implements Flash Attention (Dao et al., 2022) on CPU. The full N×N
+attention matrix is never materialized. Instead, K/V are processed
+in blocks of size B, maintaining running softmax statistics.
+
+```
+   ┌───────────────────────────────────────────────────────────┐
+   │           flash_attention(Q, K, V, n, d)                   │
+   │                                                            │
+   │  assert!(q.len() == n*d)   ◄── shape invariants           │
+   │  assert!(k.len() == n*d)                                  │
+   │  assert!(v.len() == n*d)                                  │
+   │                                                            │
+   │  scale = 1/√d                                              │
+   │  Initialize: O[n,d]=0, row_max[n]=-∞, row_sum[n]=0       │
+   │                                                            │
+   │  For each KV block j (size B=32):                          │
+   │    ┌─────────────────────────────────────────────────┐     │
+   │    │  For each query row i:                           │     │
+   │    │    1. s = Q_i · K_j^T * scale    (B scores)     │     │
+   │    │    2. block_max = max(s)                         │     │
+   │    │    3. m_new = max(row_max[i], block_max)         │     │
+   │    │    4. correction = exp(m_old - m_new)            │     │
+   │    │    5. row_sum[i] *= correction                   │     │
+   │    │       O[i,:] *= correction                       │     │
+   │    │    6. w_j = exp(s_j - m_new)                     │     │
+   │    │       row_sum[i] += Σ w_j                        │     │
+   │    │       O[i,:] += Σ w_j * V_j                      │     │
+   │    └─────────────────────────────────────────────────┘     │
+   │                                                            │
+   │  Final: O[i,:] /= row_sum[i]                              │
+   └───────────────────────────────────────────────────────────┘
+
+   Memory: O(n·d + B²) instead of O(n²)
+   B = 32 chosen so block scores fit in cache.
+```
+
+**Batched attention** for multi-head, multi-batch:
+
+```
+   flash_attention_batched(Q, K, V, batch, heads, seq, dim)
+
+   Input layout: (batch, heads, seq, dim) contiguous row-major
+   Total elements: batch × heads × seq × dim
+
+   ┌────────────────────────────────┐
+   │  For each (b, h):              │
+   │    offset = (b*heads + h) *    │
+   │             seq * dim          │
+   │    O[offset..] =               │
+   │      flash_attention(          │
+   │        Q[offset..],            │
+   │        K[offset..],            │
+   │        V[offset..],            │
+   │        seq, dim)               │
+   └────────────────────────────────┘
+```
+
+**Backward pass** (standard, non-tiled for correctness):
+
+```
+   Given: Q, K, V, grad_output (all shape n×d)
+
+   Recompute:
+     S = Q × K^T / √d        (n × n)
+     P = softmax_rows(S)      (n × n)
+
+   Gradients:
+     ∂L/∂V = P^T × grad_out               (n × d)
+     grad_P = grad_out × V^T              (n × n)
+     grad_S = softmax_rows_backward(P, grad_P)  (n × n)
+     ∂L/∂Q = grad_S × K / √d             (n × d)
+     ∂L/∂K = grad_S^T × Q / √d           (n × d)
+
+   All gradients validated against finite-difference oracles.
+```
+
+**Key invariants:**
+
+- Flash attention output matches naive attention within 1e-5.
+- All outputs are finite (no NaN/Inf).
+- Batched version produces identical per-head results.
+- Backward gradients validated against numerical finite differences.
+
+---
+
 ## Suggested Implementation Order
 
 Work bottom-up through the layers for the smoothest experience:
