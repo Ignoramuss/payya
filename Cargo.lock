@@ -58,6 +58,7 @@ name = "payya-autograd"
 version = "0.1.0"
 dependencies = [
  "payya-matmul",
+ "payya-softmax",
  "rand",
 ]
 
@@ -145,6 +146,9 @@ version = "0.1.0"
 [[package]]
 name = "payya-logit-processor"
 version = "0.1.0"
+dependencies = [
+ "rand",
+]
 
 [[package]]
 name = "payya-lora"
@@ -245,6 +249,12 @@ dependencies = [
 [[package]]
 name = "payya-transformer"
 version = "0.1.0"
+dependencies = [
+ "payya-autograd",
+ "payya-logit-processor",
+ "payya-tokenizer",
+ "rand",
+]
 
 [[package]]
 name = "payya-tts"

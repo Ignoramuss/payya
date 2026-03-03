@@ -10,6 +10,8 @@
 //! Linear algebra: matmul
 //! Reductions: sum (all elements)
 //! Shape: reshape, transpose
+//! Neural network: softmax (row-wise), layer_norm, embedding, cross_entropy,
+//!   scaled_attention (multi-head, optional causal mask)
 //!
 //! # Example
 //!
@@ -32,6 +34,18 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TensorId(usize);
 
+impl TensorId {
+    /// Create a TensorId from a raw index. Used for iterating over graph nodes.
+    pub fn from_raw(index: usize) -> Self {
+        Self(index)
+    }
+
+    /// Get the raw index.
+    pub fn raw(self) -> usize {
+        self.0
+    }
+}
+
 // ── Op ──────────────────────────────────────────────────────────────────
 
 /// Records which operation produced a tensor, and its inputs.
@@ -50,6 +64,34 @@ enum Op {
     Sum(TensorId),
     Reshape(TensorId),
     Transpose(TensorId),
+    /// Row-wise softmax on 2D input.
+    Softmax(TensorId),
+    /// Layer normalization: input (rows, cols), gamma (cols,), beta (cols,).
+    LayerNorm {
+        input: TensorId,
+        gamma: TensorId,
+        beta: TensorId,
+        eps: f32,
+    },
+    /// Gather rows from a table by index: table (vocab, dim), indices stored here.
+    Embedding {
+        table: TensorId,
+        indices: Vec<usize>,
+    },
+    /// Cross-entropy loss: logits (seq, vocab), target indices stored here → scalar.
+    CrossEntropy {
+        logits: TensorId,
+        targets: Vec<usize>,
+    },
+    /// Multi-head scaled dot-product attention with optional causal mask.
+    /// q, k, v are (seq, d_model). Internally splits into heads.
+    ScaledAttention {
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        num_heads: usize,
+        causal: bool,
+    },
 }
 
 // ── Node ────────────────────────────────────────────────────────────────
@@ -152,6 +194,17 @@ impl Graph {
     /// Check if a gradient exists for this tensor.
     pub fn has_grad(&self, id: TensorId) -> bool {
         self.nodes[id.0].grad.is_some()
+    }
+
+    /// Return the number of nodes in the graph.
+    pub fn num_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Check if a tensor is a trainable parameter (leaf with requires_grad=true).
+    pub fn is_param(&self, id: TensorId) -> bool {
+        let node = &self.nodes[id.0];
+        matches!(node.op, Op::Leaf) && node.requires_grad
     }
 
     /// Clear all gradients (call before a new forward/backward pass).
@@ -343,6 +396,273 @@ impl Graph {
         })
     }
 
+    // ── Neural network operations ─────────────────────────────────
+
+    /// Row-wise softmax on a 2D tensor: each row sums to 1.
+    ///
+    /// Input must be 2D (rows, cols). Output has the same shape.
+    pub fn softmax(&mut self, a: TensorId) -> TensorId {
+        let shape = self.nodes[a.0].shape.clone();
+        assert_eq!(shape.len(), 2, "softmax: input must be 2D, got {:?}", shape);
+        let rows = shape[0];
+        let cols = shape[1];
+        let data = payya_softmax::softmax_rows(&self.nodes[a.0].data, rows, cols);
+        self.push_node(Node {
+            data,
+            shape,
+            grad: None,
+            op: Op::Softmax(a),
+            requires_grad: true,
+        })
+    }
+
+    /// Layer normalization over the last dimension.
+    ///
+    /// - `input`: 2D (rows, cols)
+    /// - `gamma`: 1D (cols,) — scale parameter
+    /// - `beta`: 1D (cols,) — shift parameter
+    /// - `eps`: small constant for numerical stability
+    pub fn layer_norm(
+        &mut self,
+        input: TensorId,
+        gamma: TensorId,
+        beta: TensorId,
+        eps: f32,
+    ) -> TensorId {
+        let shape = self.nodes[input.0].shape.clone();
+        assert_eq!(
+            shape.len(),
+            2,
+            "layer_norm: input must be 2D, got {:?}",
+            shape
+        );
+        let rows = shape[0];
+        let cols = shape[1];
+        assert_eq!(
+            self.nodes[gamma.0].shape,
+            [cols],
+            "layer_norm: gamma shape must be [{cols}]"
+        );
+        assert_eq!(
+            self.nodes[beta.0].shape,
+            [cols],
+            "layer_norm: beta shape must be [{cols}]"
+        );
+
+        let input_data = &self.nodes[input.0].data;
+        let gamma_data = &self.nodes[gamma.0].data;
+        let beta_data = &self.nodes[beta.0].data;
+
+        let mut data = vec![0.0f32; rows * cols];
+        for i in 0..rows {
+            let row = &input_data[i * cols..(i + 1) * cols];
+            let mean: f32 = row.iter().sum::<f32>() / cols as f32;
+            let var: f32 = row.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / cols as f32;
+            let std = (var + eps).sqrt();
+            for j in 0..cols {
+                let normalized = (row[j] - mean) / std;
+                data[i * cols + j] = gamma_data[j] * normalized + beta_data[j];
+            }
+        }
+
+        self.push_node(Node {
+            data,
+            shape,
+            grad: None,
+            op: Op::LayerNorm {
+                input,
+                gamma,
+                beta,
+                eps,
+            },
+            requires_grad: true,
+        })
+    }
+
+    /// Embedding lookup: gather rows from a 2D table by index.
+    ///
+    /// - `table`: 2D (vocab_size, dim) parameter
+    /// - `indices`: which rows to select
+    ///
+    /// Returns a 2D tensor (indices.len(), dim).
+    pub fn embedding(&mut self, table: TensorId, indices: &[usize]) -> TensorId {
+        let shape = self.nodes[table.0].shape.clone();
+        assert_eq!(
+            shape.len(),
+            2,
+            "embedding: table must be 2D, got {:?}",
+            shape
+        );
+        let vocab = shape[0];
+        let dim = shape[1];
+        for &idx in indices {
+            assert!(
+                idx < vocab,
+                "embedding: index {idx} out of bounds for vocab size {vocab}"
+            );
+        }
+
+        let table_data = &self.nodes[table.0].data;
+        let seq_len = indices.len();
+        let mut data = vec![0.0f32; seq_len * dim];
+        for (i, &idx) in indices.iter().enumerate() {
+            data[i * dim..(i + 1) * dim].copy_from_slice(&table_data[idx * dim..(idx + 1) * dim]);
+        }
+
+        self.push_node(Node {
+            data,
+            shape: vec![seq_len, dim],
+            grad: None,
+            op: Op::Embedding {
+                table,
+                indices: indices.to_vec(),
+            },
+            requires_grad: true,
+        })
+    }
+
+    /// Cross-entropy loss: logits (seq, vocab), targets (seq indices) → scalar.
+    ///
+    /// Computes: -mean(log(softmax(logits)[i, target[i]]) for i in 0..seq).
+    pub fn cross_entropy(&mut self, logits: TensorId, targets: &[usize]) -> TensorId {
+        let shape = self.nodes[logits.0].shape.clone();
+        assert_eq!(
+            shape.len(),
+            2,
+            "cross_entropy: logits must be 2D, got {:?}",
+            shape
+        );
+        let seq = shape[0];
+        let vocab = shape[1];
+        assert_eq!(
+            targets.len(),
+            seq,
+            "cross_entropy: targets.len()={} must match seq={}",
+            targets.len(),
+            seq
+        );
+        for &t in targets {
+            assert!(
+                t < vocab,
+                "cross_entropy: target {t} out of bounds for vocab {vocab}"
+            );
+        }
+
+        let logits_data = &self.nodes[logits.0].data;
+        let mut total_loss = 0.0f32;
+        for i in 0..seq {
+            let row = &logits_data[i * vocab..(i + 1) * vocab];
+            let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let sum_exp: f32 = row.iter().map(|&x| (x - max_val).exp()).sum();
+            let log_softmax_target = (row[targets[i]] - max_val) - sum_exp.ln();
+            total_loss -= log_softmax_target;
+        }
+        total_loss /= seq as f32;
+
+        self.push_node(Node {
+            data: vec![total_loss],
+            shape: vec![1],
+            grad: None,
+            op: Op::CrossEntropy {
+                logits,
+                targets: targets.to_vec(),
+            },
+            requires_grad: true,
+        })
+    }
+
+    /// Multi-head scaled dot-product attention.
+    ///
+    /// - `q`, `k`, `v`: 2D (seq, d_model) where d_model = num_heads * head_dim
+    /// - `num_heads`: number of attention heads
+    /// - `causal`: if true, apply causal mask (position i attends only to j <= i)
+    ///
+    /// Returns (seq, d_model).
+    pub fn scaled_attention(
+        &mut self,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        num_heads: usize,
+        causal: bool,
+    ) -> TensorId {
+        let q_shape = self.nodes[q.0].shape.clone();
+        let k_shape = self.nodes[k.0].shape.clone();
+        let v_shape = self.nodes[v.0].shape.clone();
+        assert_eq!(q_shape.len(), 2, "attention: Q must be 2D");
+        assert_eq!(k_shape.len(), 2, "attention: K must be 2D");
+        assert_eq!(v_shape.len(), 2, "attention: V must be 2D");
+        let seq = q_shape[0];
+        let d_model = q_shape[1];
+        assert_eq!(k_shape, [seq, d_model], "attention: K shape mismatch");
+        assert_eq!(v_shape, [seq, d_model], "attention: V shape mismatch");
+        assert!(
+            d_model.is_multiple_of(num_heads),
+            "attention: d_model={d_model} not divisible by num_heads={num_heads}"
+        );
+        let d_head = d_model / num_heads;
+        let scale = 1.0 / (d_head as f32).sqrt();
+
+        let q_data = &self.nodes[q.0].data;
+        let k_data = &self.nodes[k.0].data;
+        let v_data = &self.nodes[v.0].data;
+
+        let mut output = vec![0.0f32; seq * d_model];
+
+        for h in 0..num_heads {
+            let col_start = h * d_head;
+            // Extract per-head Q, K, V (seq, d_head) from (seq, d_model).
+            let mut qh = vec![0.0f32; seq * d_head];
+            let mut kh = vec![0.0f32; seq * d_head];
+            let mut vh = vec![0.0f32; seq * d_head];
+            for i in 0..seq {
+                for j in 0..d_head {
+                    qh[i * d_head + j] = q_data[i * d_model + col_start + j];
+                    kh[i * d_head + j] = k_data[i * d_model + col_start + j];
+                    vh[i * d_head + j] = v_data[i * d_model + col_start + j];
+                }
+            }
+            // scores = Q_h @ K_h^T * scale → (seq, seq)
+            let mut scores = vec![0.0f32; seq * seq];
+            payya_matmul::matmul_a_bt(&qh, &kh, &mut scores, seq, d_head, seq);
+            for s in scores.iter_mut() {
+                *s *= scale;
+            }
+            // Apply causal mask.
+            if causal {
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        scores[i * seq + j] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            // Softmax per row.
+            let attn = payya_softmax::softmax_rows(&scores, seq, seq);
+            // out_h = attn @ V_h → (seq, d_head)
+            let out_h = payya_matmul::matmul(&attn, &vh, seq, seq, d_head);
+            // Scatter back to output columns.
+            for i in 0..seq {
+                for j in 0..d_head {
+                    output[i * d_model + col_start + j] = out_h[i * d_head + j];
+                }
+            }
+        }
+
+        self.push_node(Node {
+            data: output,
+            shape: vec![seq, d_model],
+            grad: None,
+            op: Op::ScaledAttention {
+                q,
+                k,
+                v,
+                num_heads,
+                causal,
+            },
+            requires_grad: true,
+        })
+    }
+
     // ── Broadcasting helpers ────────────────────────────────────────
 
     /// Apply a binary op with broadcasting support.
@@ -469,6 +789,37 @@ impl Graph {
                 }
                 Op::Transpose(a) => {
                     self.backward_transpose(a, &grad);
+                }
+                Op::Softmax(a) => {
+                    self.backward_softmax(idx, a, &grad);
+                }
+                Op::LayerNorm {
+                    input,
+                    gamma,
+                    beta,
+                    eps,
+                } => {
+                    self.backward_layer_norm(input, gamma, beta, eps, &grad);
+                }
+                Op::Embedding { table, ref indices } => {
+                    let indices = indices.clone();
+                    self.backward_embedding(table, &indices, &grad);
+                }
+                Op::CrossEntropy {
+                    logits,
+                    ref targets,
+                } => {
+                    let targets = targets.clone();
+                    self.backward_cross_entropy(logits, &targets, &grad);
+                }
+                Op::ScaledAttention {
+                    q,
+                    k,
+                    v,
+                    num_heads,
+                    causal,
+                } => {
+                    self.backward_scaled_attention(q, k, v, num_heads, causal, &grad);
                 }
             }
         }
@@ -690,6 +1041,216 @@ impl Graph {
         // grad is (cols, rows) shaped (the transposed shape). Transpose it back.
         let grad_a = payya_matmul::transpose(grad, cols, rows);
         self.accum_grad(a, &grad_a);
+    }
+
+    fn backward_softmax(&mut self, out_idx: usize, a: TensorId, grad: &[f32]) {
+        let shape = self.nodes[out_idx].shape.clone();
+        let rows = shape[0];
+        let cols = shape[1];
+        let softmax_out = self.nodes[out_idx].data.clone();
+        let grad_a = payya_softmax::softmax_rows_backward(&softmax_out, grad, rows, cols);
+        self.accum_grad(a, &grad_a);
+    }
+
+    fn backward_layer_norm(
+        &mut self,
+        input: TensorId,
+        gamma: TensorId,
+        beta: TensorId,
+        eps: f32,
+        grad: &[f32],
+    ) {
+        let input_data = self.nodes[input.0].data.clone();
+        let gamma_data = self.nodes[gamma.0].data.clone();
+        let shape = self.nodes[input.0].shape.clone();
+        let rows = shape[0];
+        let cols = shape[1];
+        let n = cols as f32;
+
+        let mut grad_input = vec![0.0f32; rows * cols];
+        let mut grad_gamma = vec![0.0f32; cols];
+        let mut grad_beta = vec![0.0f32; cols];
+
+        for i in 0..rows {
+            let row = &input_data[i * cols..(i + 1) * cols];
+            let g = &grad[i * cols..(i + 1) * cols];
+
+            let mean: f32 = row.iter().sum::<f32>() / n;
+            let var: f32 = row.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / n;
+            let std = (var + eps).sqrt();
+            let inv_std = 1.0 / std;
+
+            // x_hat = (x - mean) / std
+            let x_hat: Vec<f32> = row.iter().map(|&x| (x - mean) * inv_std).collect();
+
+            // grad_beta += g, grad_gamma += g * x_hat
+            for j in 0..cols {
+                grad_beta[j] += g[j];
+                grad_gamma[j] += g[j] * x_hat[j];
+            }
+
+            // grad_input: dx_hat = g * gamma
+            let dx_hat: Vec<f32> = (0..cols).map(|j| g[j] * gamma_data[j]).collect();
+
+            // dvar = sum(dx_hat * (x - mean)) * (-0.5) * (var + eps)^(-1.5)
+            let dvar: f32 = dx_hat
+                .iter()
+                .zip(row.iter())
+                .map(|(&dxh, &x)| dxh * (x - mean))
+                .sum::<f32>()
+                * (-0.5)
+                * (var + eps).powf(-1.5);
+
+            // dmean = sum(-dx_hat * inv_std) + dvar * sum(-2*(x-mean)) / n
+            let dmean: f32 = dx_hat.iter().map(|&dxh| -dxh * inv_std).sum::<f32>()
+                + dvar * row.iter().map(|&x| -2.0 * (x - mean)).sum::<f32>() / n;
+
+            // dx = dx_hat * inv_std + dvar * 2*(x-mean)/n + dmean/n
+            for j in 0..cols {
+                grad_input[i * cols + j] =
+                    dx_hat[j] * inv_std + dvar * 2.0 * (row[j] - mean) / n + dmean / n;
+            }
+        }
+
+        self.accum_grad(input, &grad_input);
+        self.accum_grad(gamma, &grad_gamma);
+        self.accum_grad(beta, &grad_beta);
+    }
+
+    fn backward_embedding(&mut self, table: TensorId, indices: &[usize], grad: &[f32]) {
+        let table_shape = self.nodes[table.0].shape.clone();
+        let vocab = table_shape[0];
+        let dim = table_shape[1];
+        let mut grad_table = vec![0.0f32; vocab * dim];
+
+        // Scatter-add gradients back to the embedding table rows.
+        for (i, &idx) in indices.iter().enumerate() {
+            for j in 0..dim {
+                grad_table[idx * dim + j] += grad[i * dim + j];
+            }
+        }
+        self.accum_grad(table, &grad_table);
+    }
+
+    fn backward_cross_entropy(&mut self, logits: TensorId, targets: &[usize], grad: &[f32]) {
+        let shape = self.nodes[logits.0].shape.clone();
+        let seq = shape[0];
+        let vocab = shape[1];
+        let logits_data = self.nodes[logits.0].data.clone();
+
+        // grad_logits = (softmax(logits) - one_hot(targets)) / seq * upstream_grad
+        let upstream = grad[0]; // scalar loss
+        let mut grad_logits = vec![0.0f32; seq * vocab];
+        for i in 0..seq {
+            let row = &logits_data[i * vocab..(i + 1) * vocab];
+            let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|&x| (x - max_val).exp()).collect();
+            let sum_exp: f32 = exps.iter().sum();
+            for j in 0..vocab {
+                let softmax_val = exps[j] / sum_exp;
+                let target_indicator = if j == targets[i] { 1.0 } else { 0.0 };
+                grad_logits[i * vocab + j] =
+                    (softmax_val - target_indicator) / seq as f32 * upstream;
+            }
+        }
+        self.accum_grad(logits, &grad_logits);
+    }
+
+    fn backward_scaled_attention(
+        &mut self,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        num_heads: usize,
+        causal: bool,
+        grad: &[f32],
+    ) {
+        let q_data = self.nodes[q.0].data.clone();
+        let k_data = self.nodes[k.0].data.clone();
+        let v_data = self.nodes[v.0].data.clone();
+        let shape = self.nodes[q.0].shape.clone();
+        let seq = shape[0];
+        let d_model = shape[1];
+        let d_head = d_model / num_heads;
+        let scale = 1.0 / (d_head as f32).sqrt();
+
+        let mut grad_q = vec![0.0f32; seq * d_model];
+        let mut grad_k = vec![0.0f32; seq * d_model];
+        let mut grad_v = vec![0.0f32; seq * d_model];
+
+        for h in 0..num_heads {
+            let col_start = h * d_head;
+
+            // Extract per-head data.
+            let mut qh = vec![0.0f32; seq * d_head];
+            let mut kh = vec![0.0f32; seq * d_head];
+            let mut vh = vec![0.0f32; seq * d_head];
+            let mut grad_out_h = vec![0.0f32; seq * d_head];
+            for i in 0..seq {
+                for j in 0..d_head {
+                    qh[i * d_head + j] = q_data[i * d_model + col_start + j];
+                    kh[i * d_head + j] = k_data[i * d_model + col_start + j];
+                    vh[i * d_head + j] = v_data[i * d_model + col_start + j];
+                    grad_out_h[i * d_head + j] = grad[i * d_model + col_start + j];
+                }
+            }
+
+            // Recompute forward: scores = Q_h @ K_h^T * scale
+            let mut scores = vec![0.0f32; seq * seq];
+            payya_matmul::matmul_a_bt(&qh, &kh, &mut scores, seq, d_head, seq);
+            for s in scores.iter_mut() {
+                *s *= scale;
+            }
+            if causal {
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        scores[i * seq + j] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            let attn = payya_softmax::softmax_rows(&scores, seq, seq);
+
+            // grad_V_h = attn^T @ grad_out_h (seq, seq)^T @ (seq, d_head) → (seq, d_head)
+            let attn_t = payya_matmul::transpose(&attn, seq, seq);
+            let gv_h = payya_matmul::matmul(&attn_t, &grad_out_h, seq, seq, d_head);
+
+            // grad_attn = grad_out_h @ V_h^T (seq, d_head) @ (d_head, seq) → (seq, seq)
+            let mut grad_attn = vec![0.0f32; seq * seq];
+            payya_matmul::matmul_a_bt(&grad_out_h, &vh, &mut grad_attn, seq, d_head, seq);
+
+            // grad_scores = softmax_backward(attn, grad_attn) per row
+            let grad_scores = payya_softmax::softmax_rows_backward(&attn, &grad_attn, seq, seq);
+
+            // Apply causal mask to gradient (masked positions get zero gradient).
+            let mut grad_scores_masked = grad_scores;
+            if causal {
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        grad_scores_masked[i * seq + j] = 0.0;
+                    }
+                }
+            }
+
+            // grad_Q_h = grad_scores @ K_h * scale (seq, seq) @ (seq, d_head) → (seq, d_head)
+            let gq_h = payya_matmul::matmul(&grad_scores_masked, &kh, seq, seq, d_head);
+
+            // grad_K_h = grad_scores^T @ Q_h * scale (seq, seq)^T @ (seq, d_head) → (seq, d_head)
+            let grad_scores_t = payya_matmul::transpose(&grad_scores_masked, seq, seq);
+            let gk_h = payya_matmul::matmul(&grad_scores_t, &qh, seq, seq, d_head);
+
+            // Scatter per-head gradients back into full d_model gradients.
+            for i in 0..seq {
+                for j in 0..d_head {
+                    grad_q[i * d_model + col_start + j] += gq_h[i * d_head + j] * scale;
+                    grad_k[i * d_model + col_start + j] += gk_h[i * d_head + j] * scale;
+                    grad_v[i * d_model + col_start + j] += gv_h[i * d_head + j];
+                }
+            }
+        }
+
+        self.accum_grad(q, &grad_q);
+        self.accum_grad(k, &grad_k);
+        self.accum_grad(v, &grad_v);
     }
 }
 
@@ -1108,6 +1669,243 @@ mod tests {
         let analytic = g.grad(w).to_vec();
         let numerical = numerical_grad(build, &w_data, &[2, 3]);
         assert_close(&analytic, &numerical, 0.02, "MLP pattern grad");
+    }
+
+    // ── New op tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_softmax_forward() {
+        let mut g = Graph::new();
+        let a = g.tensor(&[1.0, 2.0, 3.0, 1.0, 1.0, 1.0], &[2, 3]);
+        let s = g.softmax(a);
+        let data = g.data(s);
+        // Each row should sum to 1.
+        let row1_sum: f32 = data[0..3].iter().sum();
+        let row2_sum: f32 = data[3..6].iter().sum();
+        assert!((row1_sum - 1.0).abs() < 1e-5);
+        assert!((row2_sum - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_grad_softmax() {
+        let data = [1.0f32, 2.0, 0.5, -1.0, 0.0, 1.0];
+        let build = |g: &mut Graph, x: TensorId| {
+            let s = g.softmax(x);
+            g.sum(s)
+        };
+        let mut g = Graph::new();
+        let x = g.param(&data, &[2, 3]);
+        let loss = build(&mut g, x);
+        g.backward(loss);
+        let analytic = g.grad(x).to_vec();
+        let numerical = numerical_grad(build, &data, &[2, 3]);
+        assert_close(&analytic, &numerical, 0.02, "softmax grad");
+    }
+
+    #[test]
+    fn test_layer_norm_forward() {
+        let mut g = Graph::new();
+        let input = g.tensor(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let gamma = g.tensor(&[1.0, 1.0, 1.0], &[3]);
+        let beta = g.tensor(&[0.0, 0.0, 0.0], &[3]);
+        let out = g.layer_norm(input, gamma, beta, 1e-5);
+        let data = g.data(out);
+        // With gamma=1, beta=0: each row should have mean≈0, std≈1.
+        for i in 0..2 {
+            let row = &data[i * 3..(i + 1) * 3];
+            let mean: f32 = row.iter().sum::<f32>() / 3.0;
+            assert!(mean.abs() < 1e-5, "mean should be ~0, got {mean}");
+        }
+    }
+
+    #[test]
+    fn test_grad_layer_norm_input() {
+        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let build = |g: &mut Graph, x: TensorId| {
+            let gamma = g.tensor(&[0.5, 1.0, 1.5], &[3]);
+            let beta = g.tensor(&[0.1, 0.2, 0.3], &[3]);
+            let out = g.layer_norm(x, gamma, beta, 1e-5);
+            g.sum(out)
+        };
+        let mut g = Graph::new();
+        let x = g.param(&data, &[2, 3]);
+        let loss = build(&mut g, x);
+        g.backward(loss);
+        let analytic = g.grad(x).to_vec();
+        let numerical = numerical_grad(build, &data, &[2, 3]);
+        assert_close(&analytic, &numerical, 0.05, "layer_norm input grad");
+    }
+
+    #[test]
+    fn test_grad_layer_norm_gamma() {
+        let gamma_data = [0.5f32, 1.0, 1.5];
+        let build = |g: &mut Graph, gamma: TensorId| {
+            let x = g.tensor(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+            let beta = g.tensor(&[0.1, 0.2, 0.3], &[3]);
+            let out = g.layer_norm(x, gamma, beta, 1e-5);
+            g.sum(out)
+        };
+        let mut g = Graph::new();
+        let gamma = g.param(&gamma_data, &[3]);
+        let loss = build(&mut g, gamma);
+        g.backward(loss);
+        let analytic = g.grad(gamma).to_vec();
+        let numerical = numerical_grad(build, &gamma_data, &[3]);
+        assert_close(&analytic, &numerical, 0.05, "layer_norm gamma grad");
+    }
+
+    #[test]
+    fn test_embedding_forward() {
+        let mut g = Graph::new();
+        // 4-word vocab, dim=3
+        let table = g.tensor(
+            &[
+                0.1, 0.2, 0.3, // word 0
+                0.4, 0.5, 0.6, // word 1
+                0.7, 0.8, 0.9, // word 2
+                1.0, 1.1, 1.2, // word 3
+            ],
+            &[4, 3],
+        );
+        let out = g.embedding(table, &[2, 0, 3]);
+        assert_eq!(g.shape(out), &[3, 3]);
+        assert_eq!(g.data(out), &[0.7, 0.8, 0.9, 0.1, 0.2, 0.3, 1.0, 1.1, 1.2]);
+    }
+
+    #[test]
+    fn test_grad_embedding() {
+        let table_data: Vec<f32> = (0..12).map(|i| i as f32 * 0.1).collect();
+        let build = |g: &mut Graph, table: TensorId| {
+            let emb = g.embedding(table, &[1, 3, 1]);
+            g.sum(emb)
+        };
+        let mut g = Graph::new();
+        let table = g.param(&table_data, &[4, 3]);
+        let loss = build(&mut g, table);
+        g.backward(loss);
+        let analytic = g.grad(table).to_vec();
+        let numerical = numerical_grad(build, &table_data, &[4, 3]);
+        assert_close(&analytic, &numerical, 0.02, "embedding grad");
+    }
+
+    #[test]
+    fn test_cross_entropy_forward() {
+        let mut g = Graph::new();
+        // 2 positions, 3 classes. Target: [1, 0].
+        let logits = g.tensor(&[1.0, 2.0, 0.5, 3.0, 1.0, 0.0], &[2, 3]);
+        let loss = g.cross_entropy(logits, &[1, 0]);
+        let val = g.data(loss)[0];
+        // Should be a positive loss value.
+        assert!(val > 0.0, "cross-entropy loss must be positive, got {val}");
+    }
+
+    #[test]
+    fn test_grad_cross_entropy() {
+        let data = [1.0f32, 2.0, 0.5, 3.0, 1.0, 0.0, -1.0, 0.5, 2.0];
+        let build = |g: &mut Graph, logits: TensorId| g.cross_entropy(logits, &[1, 0, 2]);
+        let mut g = Graph::new();
+        let logits = g.param(&data, &[3, 3]);
+        let loss = build(&mut g, logits);
+        g.backward(loss);
+        let analytic = g.grad(logits).to_vec();
+        let numerical = numerical_grad(build, &data, &[3, 3]);
+        assert_close(&analytic, &numerical, 0.02, "cross_entropy grad");
+    }
+
+    #[test]
+    fn test_scaled_attention_single_head() {
+        let mut g = Graph::new();
+        // seq=3, d_model=4, 1 head
+        let q = g.tensor(
+            &[1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+            &[3, 4],
+        );
+        let k = g.tensor(
+            &[1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            &[3, 4],
+        );
+        let v = g.tensor(
+            &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2],
+            &[3, 4],
+        );
+        let out = g.scaled_attention(q, k, v, 1, false);
+        assert_eq!(g.shape(out), &[3, 4]);
+        // Output should be finite.
+        for &val in g.data(out) {
+            assert!(val.is_finite(), "attention output must be finite");
+        }
+    }
+
+    #[test]
+    fn test_scaled_attention_causal() {
+        let mut g = Graph::new();
+        // With causal masking, first position can only attend to itself.
+        let q = g.tensor(&[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], &[3, 2]);
+        let k = g.tensor(&[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], &[3, 2]);
+        let v = g.tensor(&[1.0, 0.0, 2.0, 0.0, 3.0, 0.0], &[3, 2]);
+        let out = g.scaled_attention(q, k, v, 1, true);
+        // First row should be exactly v[0] since it only attends to itself.
+        let data = g.data(out);
+        assert!(
+            (data[0] - 1.0).abs() < 1e-5 && (data[1] - 0.0).abs() < 1e-5,
+            "first position with causal mask should attend only to itself: [{}, {}]",
+            data[0],
+            data[1]
+        );
+    }
+
+    #[test]
+    fn test_grad_scaled_attention_q() {
+        let q_data = [0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let build = |g: &mut Graph, q: TensorId| {
+            let k = g.tensor(&[0.2, 0.1, 0.4, 0.3, 0.6, 0.5, 0.8, 0.7], &[4, 2]);
+            let v = g.tensor(&[0.1, 0.3, 0.5, 0.7, 0.2, 0.4, 0.6, 0.8], &[4, 2]);
+            let out = g.scaled_attention(q, k, v, 1, false);
+            g.sum(out)
+        };
+        let mut g = Graph::new();
+        let q = g.param(&q_data, &[4, 2]);
+        let loss = build(&mut g, q);
+        g.backward(loss);
+        let analytic = g.grad(q).to_vec();
+        let numerical = numerical_grad(build, &q_data, &[4, 2]);
+        assert_close(&analytic, &numerical, 0.05, "attention grad Q");
+    }
+
+    #[test]
+    fn test_grad_scaled_attention_v() {
+        let v_data = [0.1f32, 0.3, 0.5, 0.7, 0.2, 0.4, 0.6, 0.8];
+        let build = |g: &mut Graph, v: TensorId| {
+            let q = g.tensor(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], &[4, 2]);
+            let k = g.tensor(&[0.2, 0.1, 0.4, 0.3, 0.6, 0.5, 0.8, 0.7], &[4, 2]);
+            let out = g.scaled_attention(q, k, v, 1, false);
+            g.sum(out)
+        };
+        let mut g = Graph::new();
+        let v = g.param(&v_data, &[4, 2]);
+        let loss = build(&mut g, v);
+        g.backward(loss);
+        let analytic = g.grad(v).to_vec();
+        let numerical = numerical_grad(build, &v_data, &[4, 2]);
+        assert_close(&analytic, &numerical, 0.05, "attention grad V");
+    }
+
+    #[test]
+    fn test_grad_scaled_attention_causal() {
+        let q_data = [0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let build = |g: &mut Graph, q: TensorId| {
+            let k = g.tensor(&[0.2, 0.1, 0.4, 0.3, 0.6, 0.5], &[3, 2]);
+            let v = g.tensor(&[0.1, 0.3, 0.5, 0.7, 0.2, 0.4], &[3, 2]);
+            let out = g.scaled_attention(q, k, v, 1, true);
+            g.sum(out)
+        };
+        let mut g = Graph::new();
+        let q = g.param(&q_data, &[3, 2]);
+        let loss = build(&mut g, q);
+        g.backward(loss);
+        let analytic = g.grad(q).to_vec();
+        let numerical = numerical_grad(build, &q_data, &[3, 2]);
+        assert_close(&analytic, &numerical, 0.05, "causal attention grad Q");
     }
 
     #[test]
