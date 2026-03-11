@@ -11,3 +11,4 @@ payya-autograd = { workspace = true }
 payya-logit-processor = { workspace = true }
 payya-tokenizer = { workspace = true }
 rand = { workspace = true }
+serde = { workspace = true }

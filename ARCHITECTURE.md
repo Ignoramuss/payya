@@ -926,6 +926,199 @@ Supports sinusoidal and RoPE positional encodings.
 
 ---
 
+### M5: `payya-embedding` — Sentence Embedding Model
+
+Wraps a transformer backbone to produce fixed-size vector representations
+of token sequences. Supports mean pooling and first-token (CLS-style) pooling.
+
+```
+   ┌───────────────────────────────────────────────────────┐
+   │              EmbeddingModel                            │
+   │                                                        │
+   │  tokens: [t₀, t₁, ..., tₙ₋₁]                         │
+   │                                                        │
+   │  1. Transformer forward_hidden(tokens)                 │
+   │     ┌──────────────────────────────────────┐           │
+   │     │  Token embedding + positional encoding│           │
+   │     │  N × Transformer blocks               │           │
+   │     │  Final layer norm                      │           │
+   │     │  → hidden states (seq, d_model)        │           │
+   │     └──────────────────────────────────────┘           │
+   │                                                        │
+   │  2. Pooling: hidden (seq, d_model) → embedding (d_model)│
+   │     ┌────────────────────────────────────────────┐     │
+   │     │  Mean:       emb = mean(h₀, h₁, ..., hₙ₋₁) │     │
+   │     │              emb_j = (1/n) Σᵢ h_i,j         │     │
+   │     │                                              │     │
+   │     │  FirstToken: emb = h₀                        │     │
+   │     │              (CLS-style, first position only) │     │
+   │     └────────────────────────────────────────────┘     │
+   │                                                        │
+   │  Output: Vec<f32> of length d_model                    │
+   └───────────────────────────────────────────────────────┘
+```
+
+**Similarity functions:**
+
+```
+   cosine_similarity(a, b) = dot(a, b) / (‖a‖ × ‖b‖)
+
+   l2_normalize(v) = v / ‖v‖
+
+   Typical usage:
+     emb_a = model.embed(tokens_a)
+     emb_b = model.embed(tokens_b)
+     similarity = cosine_similarity(&emb_a, &emb_b)
+     // → 1.0 if identical direction, 0.0 if orthogonal, -1.0 if opposite
+```
+
+**Key invariants:**
+
+- Embedding dimension always equals `d_model`.
+- All embedding values are finite.
+- Mean pooling on a single token equals first-token pooling.
+- `cosine_similarity(v, v) == 1.0` for any non-zero vector.
+- `l2_normalize(v)` produces unit-length vectors.
+
+---
+
+### M5: `payya-slm` — Small Language Model (End-to-End)
+
+Wires together `payya-transformer`, `payya-tokenizer`, and `payya-logit-processor`
+into a single trainable language model with text-in/text-out training, generation,
+and checkpoint save/load.
+
+```
+   ┌────────────────────────────────────────────────────────────┐
+   │                          Slm                                │
+   │                                                             │
+   │  ┌────────────┐  ┌──────────────┐  ┌───────────────────┐   │
+   │  │ Tokenizer  │  │ Transformer  │  │ LogitProcessor    │   │
+   │  │ (optional) │  │              │  │ (for generation)  │   │
+   │  └─────┬──────┘  └──────┬───────┘  └────────┬──────────┘   │
+   │        │                │                    │              │
+   │        │   encode()     │   forward()        │  sample()    │
+   │        ▼                ▼                    ▼              │
+   │  "the cat" ──► [t₀,t₁] ──► logits ──► next token          │
+   └────────────────────────────────────────────────────────────┘
+```
+
+**Training pipeline:**
+
+```
+   ┌────────────────────────────────────────────────────────────┐
+   │              train_step_ids(tokens, config)                  │
+   │                                                             │
+   │  input  = tokens[:-1]                                       │
+   │  target = tokens[1:]      ◄── next-token prediction         │
+   │                                                             │
+   │  1. Forward pass → logits (seq-1, vocab)                    │
+   │  2. Loss = CrossEntropy(logits, target)                     │
+   │  3. Backward → gradients for all parameters                 │
+   │                                                             │
+   │  4. Learning rate with warmup:                              │
+   │     ┌──────────────────────────────────────────┐            │
+   │     │  if step < warmup_steps:                 │            │
+   │     │    lr_eff = lr × (step+1) / warmup_steps │            │
+   │     │  else:                                   │            │
+   │     │    lr_eff = lr                            │            │
+   │     └──────────────────────────────────────────┘            │
+   │                                                             │
+   │  5. Gradient clipping (global norm):                        │
+   │     ┌──────────────────────────────────────────┐            │
+   │     │  global_norm = √(Σ grad_i²)              │            │
+   │     │  if global_norm > max_norm:               │            │
+   │     │    scale = max_norm / global_norm          │            │
+   │     │    grad_i *= scale                         │            │
+   │     └──────────────────────────────────────────┘            │
+   │                                                             │
+   │  6. Weight decay (decoupled, AdamW-style):                  │
+   │     param *= (1 - lr × weight_decay)                        │
+   │                                                             │
+   │  7. SGD update:                                             │
+   │     param -= lr_eff × clipped_grad                          │
+   └────────────────────────────────────────────────────────────┘
+```
+
+**Text training (train_text):**
+
+```
+   corpus: "the cat sat on the mat..."
+       │
+       ▼
+   tokenizer.encode() → [t₀, t₁, t₂, ..., tₙ]
+       │
+       ▼
+   Sliding window chunks (window_size tokens each):
+   ┌──────────────────────┐
+   │  [t₀ ... t_w]        │──► train_step_ids
+   │  [t₃ ... t_{w+3}]    │──► train_step_ids
+   │  [t₇ ... t_{w+7}]    │──► train_step_ids
+   │  ...                  │
+   └──────────────────────┘
+   Stride through corpus deterministically: start = (i × 7) % max_start
+```
+
+**Checkpoint format (JSON):**
+
+```
+   ┌──────────────────────────────────────┐
+   │            Checkpoint                  │
+   │                                        │
+   │  config: SlmConfig                     │
+   │    ├── vocab_size, d_model, n_heads   │
+   │    ├── n_layers, d_ff, max_seq_len    │
+   │                                        │
+   │  params: TransformerParams             │
+   │    ├── token_emb: [f32; vocab×d]      │
+   │    ├── layers: [LayerParams; n_layers] │
+   │    ├── final_ln_gamma, final_ln_beta  │
+   │    └── output_weight, output_bias     │
+   │                                        │
+   │  tokenizer: Option<String>  (JSON)     │
+   │  step: usize                           │
+   └──────────────────────────────────────┘
+
+   Save:  slm.checkpoint().to_bytes() → Vec<u8>
+   Load:  Slm::from_checkpoint(Checkpoint::from_bytes(&bytes))
+
+   Invariant: save → load → continue training produces no loss spike.
+```
+
+**Generation pipeline:**
+
+```
+   generate_text(prompt, max_new_tokens, processor, rng)
+
+   "the cat" ──► tokenizer.encode() ──► [t₀, t₁]
+                                              │
+                    ┌─────────────────────────┘
+                    ▼
+               ┌─────────────────────────────────────┐
+               │  loop (max_new_tokens iterations):   │
+               │    forward(tokens) → logits          │
+               │    last_logits = logits[-1, :]        │
+               │    processor.sample(last_logits)      │
+               │    tokens.push(next_token)            │
+               └─────────────────────────────────────┘
+                    │
+                    ▼
+               tokenizer.decode(tokens) ──► "the cat sat on..."
+```
+
+**Key invariants:**
+
+- All training losses are finite (no NaN/Inf).
+- Training loss decreases on repeated data (overfitting test).
+- Gradient clipping keeps updates bounded even with high learning rates.
+- Weight decay monotonically shrinks parameter norms.
+- Checkpoint round-trip preserves exact parameter values.
+- Continuing training after checkpoint restore produces no loss spike.
+- Generated tokens are valid indices (< vocab_size).
+- Warmup linearly increases LR from 0 to `lr` over `warmup_steps`.
+
+---
+
 ## Suggested Implementation Order
 
 Work bottom-up through the layers for the smoothest experience:

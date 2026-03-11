@@ -6,18 +6,19 @@
 
 use payya_autograd::{Graph, TensorId};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 // ── Configuration ────────────────────────────────────────────────────
 
 /// Positional encoding strategy.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PosEncoding {
     Sinusoidal,
     RoPE,
 }
 
 /// Transformer hyperparameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransformerConfig {
     pub vocab_size: usize,
     pub d_model: usize,
@@ -43,47 +44,47 @@ impl TransformerConfig {
 // ── Parameter storage ────────────────────────────────────────────────
 
 /// All learnable parameters for one transformer layer.
-#[derive(Debug, Clone)]
-struct LayerParams {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerParams {
     /// Attention Q, K, V projection weights: (d_model, d_model) each.
-    wq: Vec<f32>,
-    wk: Vec<f32>,
-    wv: Vec<f32>,
+    pub wq: Vec<f32>,
+    pub wk: Vec<f32>,
+    pub wv: Vec<f32>,
     /// Attention output projection: (d_model, d_model).
-    wo: Vec<f32>,
+    pub wo: Vec<f32>,
     /// Attention biases: (d_model,) each.
-    bq: Vec<f32>,
-    bk: Vec<f32>,
-    bv: Vec<f32>,
-    bo: Vec<f32>,
+    pub bq: Vec<f32>,
+    pub bk: Vec<f32>,
+    pub bv: Vec<f32>,
+    pub bo: Vec<f32>,
     /// Layer norm 1 (pre-attention): gamma, beta (d_model,).
-    ln1_gamma: Vec<f32>,
-    ln1_beta: Vec<f32>,
+    pub ln1_gamma: Vec<f32>,
+    pub ln1_beta: Vec<f32>,
     /// FFN weights: W1 (d_model, d_ff), W2 (d_ff, d_model).
-    w1: Vec<f32>,
-    w2: Vec<f32>,
+    pub w1: Vec<f32>,
+    pub w2: Vec<f32>,
     /// FFN biases: b1 (d_ff,), b2 (d_model,).
-    b1: Vec<f32>,
-    b2: Vec<f32>,
+    pub b1: Vec<f32>,
+    pub b2: Vec<f32>,
     /// Layer norm 2 (pre-FFN): gamma, beta (d_model,).
-    ln2_gamma: Vec<f32>,
-    ln2_beta: Vec<f32>,
+    pub ln2_gamma: Vec<f32>,
+    pub ln2_beta: Vec<f32>,
 }
 
 /// All learnable parameters for the full transformer model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransformerParams {
     /// Token embedding table: (vocab_size, d_model).
-    token_emb: Vec<f32>,
+    pub token_emb: Vec<f32>,
     /// Layers.
-    layers: Vec<LayerParams>,
+    pub layers: Vec<LayerParams>,
     /// Final layer norm: gamma, beta (d_model,).
-    final_ln_gamma: Vec<f32>,
-    final_ln_beta: Vec<f32>,
+    pub final_ln_gamma: Vec<f32>,
+    pub final_ln_beta: Vec<f32>,
     /// Output head (tied or separate): (d_model, vocab_size).
-    output_weight: Vec<f32>,
+    pub output_weight: Vec<f32>,
     /// Output bias: (vocab_size,).
-    output_bias: Vec<f32>,
+    pub output_bias: Vec<f32>,
 }
 
 /// Initialize a parameter vector with Xavier/Glorot uniform distribution.
@@ -207,6 +208,7 @@ pub fn apply_rope_inverse(data: &mut [f32], seq: usize, dim: usize) {
 // ── Transformer model ────────────────────────────────────────────────
 
 /// A decoder-only Transformer language model.
+#[derive(Clone)]
 pub struct Transformer {
     pub config: TransformerConfig,
     pub params: TransformerParams,
@@ -228,6 +230,58 @@ impl Transformer {
             params,
             pe_table,
         }
+    }
+
+    /// Create a transformer from an existing config and params.
+    pub fn from_params(config: TransformerConfig, params: TransformerParams) -> Self {
+        let pe_table = if config.pos_encoding == PosEncoding::Sinusoidal {
+            sinusoidal_encoding(config.max_seq_len, config.d_model)
+        } else {
+            Vec::new()
+        };
+        Self {
+            config,
+            params,
+            pe_table,
+        }
+    }
+
+    /// Run forward pass returning hidden states (seq, d_model) after final layer norm,
+    /// before the output projection. Useful for building embedding models.
+    pub fn forward_hidden(&self, tokens: &[usize]) -> (Graph, TensorId) {
+        let cfg = &self.config;
+        let seq = tokens.len();
+        assert!(
+            seq <= cfg.max_seq_len,
+            "sequence length {seq} exceeds max_seq_len {}",
+            cfg.max_seq_len
+        );
+        assert!(seq > 0, "tokens must not be empty");
+        let d = cfg.d_model;
+
+        let mut g = Graph::new();
+
+        let emb_table = g.param(&self.params.token_emb, &[cfg.vocab_size, d]);
+        let mut x = g.embedding(emb_table, tokens);
+
+        match cfg.pos_encoding {
+            PosEncoding::Sinusoidal => {
+                let pe_data: Vec<f32> = self.pe_table[..seq * d].to_vec();
+                let pe = g.tensor(&pe_data, &[seq, d]);
+                x = g.add(x, pe);
+            }
+            PosEncoding::RoPE => {}
+        }
+
+        for layer in &self.params.layers {
+            x = self.forward_layer(&mut g, x, layer, seq);
+        }
+
+        let final_gamma = g.param(&self.params.final_ln_gamma, &[d]);
+        let final_beta = g.param(&self.params.final_ln_beta, &[d]);
+        x = g.layer_norm(x, final_gamma, final_beta, 1e-5);
+
+        (g, x)
     }
 
     /// Run the forward pass, returning logits (seq, vocab_size).
