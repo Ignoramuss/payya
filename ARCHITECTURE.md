@@ -752,6 +752,180 @@ in blocks of size B, maintaining running softmax statistics.
 
 ---
 
+### M4: `payya-logit-processor` — Logit Processing & Sampling
+
+Provides composable logit processing strategies for controlling text
+generation: temperature scaling, top-k filtering, nucleus (top-p) sampling,
+and repetition penalty.
+
+```
+   ┌──────────────────────────────────────────────────────────┐
+   │              LogitProcessor pipeline                      │
+   │                                                           │
+   │  Input: raw logits[vocab_size]                            │
+   │                                                           │
+   │  1. Repetition penalty (optional)                         │
+   │     For each token in past_tokens:                        │
+   │       logit > 0 → logit /= penalty                       │
+   │       logit < 0 → logit *= penalty                        │
+   │                                                           │
+   │  2. Temperature scaling (optional)                        │
+   │     logits[i] /= temperature                              │
+   │     Higher T → more uniform, Lower T → more peaked        │
+   │                                                           │
+   │  3. Top-k filtering (optional)                            │
+   │     Keep top-k logits, set rest to -∞                     │
+   │     ┌────────────────────────────────┐                    │
+   │     │  sorted = sort(logits, desc)   │                    │
+   │     │  threshold = sorted[k-1]       │                    │
+   │     │  if logit < threshold: -∞      │                    │
+   │     └────────────────────────────────┘                    │
+   │                                                           │
+   │  4. Top-p (nucleus) filtering (optional)                  │
+   │     ┌────────────────────────────────┐                    │
+   │     │  probs = softmax(logits)       │                    │
+   │     │  sort by prob descending       │                    │
+   │     │  cumsum until >= p             │                    │
+   │     │  mask out rest to -∞           │                    │
+   │     └────────────────────────────────┘                    │
+   │                                                           │
+   │  5. Softmax → categorical sample                          │
+   │     probs = softmax(logits)                               │
+   │     return categorical_sample(probs)                      │
+   └──────────────────────────────────────────────────────────┘
+```
+
+**Key invariants:**
+
+- All strategies produce valid probability distributions (non-negative,
+  sum to 1) after softmax.
+- Temperature must be > 0. Penalty must be >= 1.0. k must be > 0.
+  p must be in (0, 1].
+- Processing order is deterministic: rep_penalty → temperature → top_k → top_p.
+
+---
+
+### M4: `payya-transformer` — Decoder-Only Transformer
+
+A GPT-style decoder-only transformer with multi-head causal self-attention,
+feed-forward networks, pre-norm layer normalization, and residual connections.
+Supports sinusoidal and RoPE positional encodings.
+
+```
+   ┌──────────────────────────────────────────────────────────┐
+   │              Transformer Forward Pass                     │
+   │                                                           │
+   │  tokens: [t₀, t₁, ..., tₙ₋₁]                            │
+   │                                                           │
+   │  1. Embedding lookup                                      │
+   │     x = token_emb[tokens]         (seq, d_model)          │
+   │                                                           │
+   │  2. Positional encoding                                   │
+   │     Sinusoidal: x += PE_table[:seq]                       │
+   │     RoPE: applied to Q,K inside attention                 │
+   │                                                           │
+   │  3. N × Transformer Block                                 │
+   │     ┌────────────────────────────────────────────┐        │
+   │     │  residual = x                              │        │
+   │     │  x = LayerNorm(x)                          │        │
+   │     │  Q = x @ Wq + bq                           │        │
+   │     │  K = x @ Wk + bk      ◄── linear projs     │        │
+   │     │  V = x @ Wv + bv                           │        │
+   │     │  [optional: apply RoPE to Q, K]            │        │
+   │     │  x = MultiHeadAttention(Q, K, V, causal)   │        │
+   │     │  x = x @ Wo + bo                           │        │
+   │     │  x = residual + x     ◄── skip connection  │        │
+   │     │                                             │        │
+   │     │  residual = x                              │        │
+   │     │  x = LayerNorm(x)                          │        │
+   │     │  x = ReLU(x @ W1 + b1) @ W2 + b2  ◄ FFN  │        │
+   │     │  x = residual + x     ◄── skip connection  │        │
+   │     └────────────────────────────────────────────┘        │
+   │                                                           │
+   │  4. Final LayerNorm                                       │
+   │  5. Output projection: logits = x @ Wout + bout           │
+   │     logits shape: (seq, vocab_size)                       │
+   └──────────────────────────────────────────────────────────┘
+```
+
+**Multi-head attention detail:**
+
+```
+   Input: Q, K, V  each (seq, d_model)
+   d_head = d_model / num_heads
+
+   For each head h ∈ [0, num_heads):
+     Q_h = Q[:, h*d_head : (h+1)*d_head]   (seq, d_head)
+     K_h = K[:, h*d_head : (h+1)*d_head]
+     V_h = V[:, h*d_head : (h+1)*d_head]
+
+     scores = Q_h @ K_h^T / √d_head        (seq, seq)
+
+     Causal mask:
+       scores[i][j] = -∞  for j > i        ◄── prevents
+                                                attending to
+                                                future tokens
+
+     attn = softmax_rows(scores)            (seq, seq)
+     out_h = attn @ V_h                     (seq, d_head)
+
+   Output = concat(out_0, ..., out_{H-1})   (seq, d_model)
+```
+
+**Training loop (SGD):**
+
+```
+   ┌──────────────────────────────────────────────────┐
+   │              Training Step                        │
+   │                                                   │
+   │  input  = tokens[:-1]                             │
+   │  target = tokens[1:]    ◄── next-token prediction │
+   │                                                   │
+   │  1. Forward pass → logits (seq-1, vocab)          │
+   │  2. Loss = CrossEntropy(logits, target)           │
+   │  3. Backward → gradients for all parameters       │
+   │  4. SGD: param -= lr × grad                       │
+   │                                                   │
+   │  Parameters per layer:                            │
+   │    Wq, Wk, Wv, Wo: (d_model, d_model)  × 4      │
+   │    bq, bk, bv, bo: (d_model,)           × 4      │
+   │    W1: (d_model, d_ff), W2: (d_ff, d_model)      │
+   │    b1: (d_ff,), b2: (d_model,)                    │
+   │    LN1 γ,β: (d_model,) × 2                       │
+   │    LN2 γ,β: (d_model,) × 2                       │
+   │                                                   │
+   │  Global: token_emb (vocab, d_model)               │
+   │          final_LN γ,β, output W,b                 │
+   └──────────────────────────────────────────────────┘
+```
+
+**Autograd extensions** (added to `payya-autograd` for M4):
+
+```
+   ┌──────────────┬─────────────────────┬──────────────────────────────┐
+   │ Operation    │ Forward             │ Backward (∂L/∂input)         │
+   ├──────────────┼─────────────────────┼──────────────────────────────┤
+   │ softmax(x)   │ row-wise softmax    │ s_i*(g_i - dot(g,s))        │
+   │ layer_norm   │ (x-μ)/σ * γ + β    │ standard LN grad formula    │
+   │ embedding    │ gather rows by idx  │ scatter-add to table rows   │
+   │ cross_entropy│ -mean(log_softmax)  │ (softmax - one_hot) / seq   │
+   │ scaled_attn  │ multi-head QKV attn │ per-head score/softmax grad │
+   └──────────────┴─────────────────────┴──────────────────────────────┘
+
+   All gradients validated against finite-difference numerical gradients.
+```
+
+**Key invariants:**
+
+- All outputs are finite (no NaN/Inf) for valid inputs.
+- Causal masking ensures position i attends only to positions ≤ i.
+- Layer norm output has approximately zero mean per row.
+- Cross-entropy loss is non-negative.
+- Training loss decreases monotonically on repeated data (overfitting test).
+- Generation produces valid token indices (< vocab_size).
+
+---
+
 ## Suggested Implementation Order
 
 Work bottom-up through the layers for the smoothest experience:

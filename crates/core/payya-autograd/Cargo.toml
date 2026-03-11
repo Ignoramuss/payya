@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 payya-matmul = { workspace = true }
+payya-softmax = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
