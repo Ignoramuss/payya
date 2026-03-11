@@ -97,6 +97,12 @@ version = "0.1.0"
 [[package]]
 name = "payya-embedding"
 version = "0.1.0"
+dependencies = [
+ "payya-autograd",
+ "payya-transformer",
+ "rand",
+ "serde",
+]
 
 [[package]]
 name = "payya-eval"
@@ -212,6 +218,16 @@ version = "0.1.0"
 [[package]]
 name = "payya-slm"
 version = "0.1.0"
+dependencies = [
+ "payya-autograd",
+ "payya-embedding",
+ "payya-logit-processor",
+ "payya-tokenizer",
+ "payya-transformer",
+ "rand",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "payya-softmax"
@@ -254,6 +270,7 @@ dependencies = [
  "payya-logit-processor",
  "payya-tokenizer",
  "rand",
+ "serde",
 ]
 
 [[package]]
