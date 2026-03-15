@@ -1119,6 +1119,276 @@ and checkpoint save/load.
 
 ---
 
+### M6: `payya-kv-cache` — Paged KV Cache
+
+Paged block-based KV cache inspired by vLLM. Sequences don't own contiguous
+memory; instead, a `BlockAllocator` manages a pool of fixed-size blocks, and
+each sequence maintains a block table mapping logical positions to physical
+blocks.
+
+```
+   ┌──────────────────────────────────────────────────────────┐
+   │                    PagedKvCache                           │
+   │                                                           │
+   │  Config:                                                  │
+   │    block_size: tokens per block (e.g. 16)                 │
+   │    n_layers × n_heads × d_head: dims                      │
+   │                                                           │
+   │  ┌──────────────────────────────────────────────────┐     │
+   │  │           BlockAllocator                          │     │
+   │  │  total_blocks: N                                  │     │
+   │  │  free_list: Vec<usize>  (stack-based allocation)  │     │
+   │  │                                                   │     │
+   │  │  alloc() → Option<usize>   (pop from free list)   │     │
+   │  │  free(id)                  (push to free list)    │     │
+   │  └──────────────────────────────────────────────────┘     │
+   │                                                           │
+   │  Storage: Vec<f32>  (total_blocks × floats_per_block)     │
+   │                                                           │
+   │  Block layout (per block):                                │
+   │  ┌─────────────────────────────────────────────────┐      │
+   │  │  K data: block_size × (n_layers × n_heads × d_head)│   │
+   │  │  V data: block_size × (n_layers × n_heads × d_head)│   │
+   │  └─────────────────────────────────────────────────┘      │
+   │                                                           │
+   │  Sequences: Vec<Option<SequenceState>>                    │
+   │  ┌──────────────────────┐                                 │
+   │  │  SequenceState       │                                 │
+   │  │    block_table: [0, 3, 7]  ◄── logical→physical map   │
+   │  │    len: 40                 ◄── tokens cached           │
+   │  └──────────────────────┘                                 │
+   └──────────────────────────────────────────────────────────┘
+```
+
+**Data flow (append):**
+
+```
+   append(seq_id, k_data, v_data)
+   ┌────────────────────────────────────────────────────┐
+   │  For each new token:                               │
+   │    1. Compute block index = pos / block_size       │
+   │    2. If new block needed → alloc() from pool      │
+   │       Err(OutOfMemory) if free_list empty          │
+   │    3. Copy K data to:                              │
+   │       storage[phys_block * fpb + pos_in_block * kv]│
+   │    4. Copy V data to:                              │
+   │       storage[phys_block * fpb + BS*kv + pos*kv]   │
+   │    5. len += 1                                     │
+   └────────────────────────────────────────────────────┘
+```
+
+**Key invariants:**
+
+- Block IDs are unique across all sequences (no aliasing).
+- Removing a sequence frees all its blocks back to the allocator.
+- Memory is bounded: total_blocks × floats_per_block × 4 bytes.
+- Repeated alloc/free cycles don't leak blocks.
+
+---
+
+### M6: `payya-quantization` — Int8 Post-Training Quantization
+
+Symmetric per-tensor quantization from f32 to i8, with quantized matrix
+multiplication that accumulates in i32 to avoid overflow.
+
+```
+   ┌────────────────────────────────────────────────────────────┐
+   │              Quantization Pipeline                          │
+   │                                                             │
+   │  f32 weights                                                │
+   │  [0.5, -1.2, 0.8, ...]                                     │
+   │       │                                                     │
+   │       ▼                                                     │
+   │  1. Compute scale:                                          │
+   │     abs_max = max(|x_i|)                                    │
+   │     scale = abs_max / 127                                   │
+   │                                                             │
+   │  2. Quantize:                                               │
+   │     q_i = clamp(round(x_i / scale), -128, 127)             │
+   │                                                             │
+   │       ▼                                                     │
+   │  QuantizedTensor                                            │
+   │  ┌──────────────────────────────────────┐                   │
+   │  │  data: Vec<i8>     ◄── 1 byte/elem   │                   │
+   │  │  scale: f32        ◄── single value   │                   │
+   │  │  shape: (rows, cols)                  │                   │
+   │  └──────────────────────────────────────┘                   │
+   │                                                             │
+   │  3. Dequantize (when needed):                               │
+   │     x_i ≈ q_i × scale                                      │
+   │                                                             │
+   │  Memory: 1 byte/element (vs 4 bytes for f32) → ~4× savings │
+   └────────────────────────────────────────────────────────────┘
+```
+
+**Quantized matmul:**
+
+```
+   quantized_matmul(A_q, B_q) → C_f32
+
+   A_q: (m, k) i8, scale_a
+   B_q: (k, n) i8, scale_b
+
+   ┌─────────────────────────────────────────────┐
+   │  For each (i, j):                           │
+   │    acc: i32 = Σ_p A_q[i,p] × B_q[p,j]      │
+   │    C[i,j] = acc × (scale_a × scale_b)       │
+   │                                              │
+   │  i32 accumulator prevents overflow:          │
+   │    max accumulation = 127 × 127 × k          │
+   │    fits i32 for k up to ~133,000             │
+   └─────────────────────────────────────────────┘
+```
+
+**Key invariants:**
+
+- Dequantized values preserve the sign of the original.
+- Max quantization error bounded by scale / 2.
+- Quantized matmul matches f32 matmul within quantization tolerance.
+- Zero inputs produce zero quantized values.
+
+---
+
+### M6: `payya-prompt-cache` — Radix-Tree Prefix Matching
+
+A compressed trie (radix tree) over token sequences for finding the longest
+cached prefix. When multiple requests share a system prompt, the KV cache
+for that prefix can be reused, reducing time-to-first-token.
+
+```
+   ┌──────────────────────────────────────────────────────┐
+   │                   RadixTree                           │
+   │                                                       │
+   │  root: Node                                           │
+   │    ├── edge [100, 101, 102] → Node (cache_id: 0)     │
+   │    │     ├── edge [200, 201] → Node (cache_id: 1)    │
+   │    │     └── edge [300]      → Node (cache_id: 2)    │
+   │    └── edge [400, 401] → Node (cache_id: 3)          │
+   │                                                       │
+   │  Node { children: HashMap<TokenId, Edge>,             │
+   │         cache_id: Option<CacheId> }                   │
+   │                                                       │
+   │  Edge { label: Vec<TokenId>,                          │
+   │         child: Node }                                 │
+   └──────────────────────────────────────────────────────┘
+```
+
+**Lookup algorithm:**
+
+```
+   lookup([100, 101, 102, 200, 201, 999])
+
+   1. Match edge [100, 101, 102] → node (cache_id: 0)  ✓ best=0, len=3
+   2. Match edge [200, 201]      → node (cache_id: 1)  ✓ best=1, len=5
+   3. No edge starting with 999  → stop
+   4. Return PrefixMatch { cache_id: 1, matched_len: 5 }
+
+   → Only 1 new token (999) needs KV computation.
+```
+
+**Edge splitting (insert diverging path):**
+
+```
+   Before: edge [1, 2, 3, 4, 5] → node A
+   Insert: [1, 2, 3, 6, 7]
+
+   After:  edge [1, 2, 3] → split_node
+             ├── edge [4, 5] → node A
+             └── edge [6, 7] → node B (new, cache_id assigned)
+```
+
+**Key invariants:**
+
+- Lookup returns the longest matching cached prefix.
+- Duplicate inserts return the same cache ID.
+- Removing a cache entry preserves sibling entries.
+- The tree structure is always a valid radix tree (no empty edges).
+
+---
+
+### M6: `payya-server` — HTTP Inference Server
+
+An axum-based HTTP server exposing an OpenAI-compatible `/v1/chat/completions`
+endpoint. Supports both non-streaming JSON responses and SSE streaming.
+
+```
+   ┌────────────────────────────────────────────────────────────┐
+   │                     payya-server                            │
+   │                                                             │
+   │  ┌──────────────────────────────────────────────────────┐   │
+   │  │                    axum Router                        │   │
+   │  │                                                       │   │
+   │  │  GET  /health             → HealthResponse            │   │
+   │  │  POST /v1/chat/completions → ChatCompletionResponse   │   │
+   │  │                              or SSE stream             │   │
+   │  └──────────────────────┬────────────────────────────────┘   │
+   │                         │                                    │
+   │  ┌──────────────────────▼────────────────────────────────┐   │
+   │  │               AppState (shared)                        │   │
+   │  │                                                        │   │
+   │  │  engine: Mutex<InferenceEngine>                        │   │
+   │  │  semaphore: Semaphore(max_concurrent)                  │   │
+   │  │  model_name: String                                    │   │
+   │  └──────────────────────┬────────────────────────────────┘   │
+   │                         │                                    │
+   │  ┌──────────────────────▼────────────────────────────────┐   │
+   │  │             InferenceEngine                            │   │
+   │  │                                                        │   │
+   │  │  slm: Slm              ◄── language model              │   │
+   │  │  prompt_cache: RadixTree ◄── prefix matching           │   │
+   │  │  seed: u64              ◄── deterministic RNG          │   │
+   │  └────────────────────────────────────────────────────────┘   │
+   └────────────────────────────────────────────────────────────┘
+```
+
+**Request flow (non-streaming):**
+
+```
+   POST /v1/chat/completions
+   { "messages": [...], "max_tokens": 128, "temperature": 0.7 }
+        │
+        ▼
+   1. Acquire semaphore permit (bounded concurrency)
+   2. Validate request (messages non-empty)
+   3. Format messages → prompt string
+   4. Check prompt cache → prefix hit?
+        │
+        ▼
+   5. engine.generate(messages, max_tokens, temperature, top_p)
+        │ tokenize → forward → sample → decode
+        ▼
+   6. Return ChatCompletionResponse {
+        id: "chatcmpl-<uuid>",
+        choices: [{ message: { role: "assistant", content: "..." } }],
+        usage: { prompt_tokens, completion_tokens, total_tokens }
+      }
+```
+
+**SSE streaming flow:**
+
+```
+   POST /v1/chat/completions  (stream: true)
+        │
+        ▼
+   Generate full response, then stream word-by-word:
+
+   data: {"choices":[{"delta":{"role":"assistant"}}]}
+   data: {"choices":[{"delta":{"content":"Hello "}}]}
+   data: {"choices":[{"delta":{"content":"world"}}]}
+   data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+   data: [DONE]
+```
+
+**Key invariants:**
+
+- Concurrent requests bounded by semaphore (default: 10).
+- Empty messages rejected with 400 Bad Request.
+- All responses include valid JSON with required OpenAI fields.
+- SSE streams always end with `[DONE]` sentinel.
+- Prompt cache accumulates entries for prefix reuse.
+
+---
+
 ## Suggested Implementation Order
 
 Work bottom-up through the layers for the smoothest experience:

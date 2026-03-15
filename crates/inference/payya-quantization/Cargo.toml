@@ -1,6 +1,6 @@
 [package]
 name = "payya-quantization"
-description = "Quantization library (Int8/FP4)"
+description = "Post-training quantization (Int8) for reduced memory and faster inference"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
