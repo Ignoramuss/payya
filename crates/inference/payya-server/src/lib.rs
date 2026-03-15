@@ -642,7 +642,7 @@ mod tests {
         engine.generate(&msgs2, 5, 1.0, None);
 
         // The prompt cache should have entries.
-        assert!(engine.prompt_cache.len() >= 1);
+        assert!(!engine.prompt_cache.is_empty());
     }
 
     #[tokio::test]

@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn concurrent_sequences() {
         let mut cache = PagedKvCache::new(4, 16, 1, 2, 4, 4);
-        let kv_per_pos = 1 * 2 * 4; // 8
+        let kv_per_pos = 2 * 4; // n_layers(1) * n_heads(2) * d_head(4) = 8
 
         let s0 = cache.add_sequence();
         let s1 = cache.add_sequence();
@@ -565,7 +565,7 @@ mod tests {
         let v0: Vec<f32> = (0..3 * kv_per_pos).map(|i| 100.0 + i as f32).collect();
         cache.append(s0, &k0, &v0).unwrap();
 
-        let k1: Vec<f32> = (0..5 * kv_per_pos).map(|i| -1.0 * i as f32).collect();
+        let k1: Vec<f32> = (0..5 * kv_per_pos).map(|i| -(i as f32)).collect();
         let v1: Vec<f32> = (0..5 * kv_per_pos).map(|i| -100.0 - i as f32).collect();
         cache.append(s1, &k1, &v1).unwrap();
 
