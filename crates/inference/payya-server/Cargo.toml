@@ -1,9 +1,24 @@
 [package]
 name = "payya-server"
-description = "Inference server"
+description = "HTTP inference server with OpenAI-compatible API and SSE streaming"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+payya-slm = { workspace = true }
+payya-tokenizer = { workspace = true }
+payya-logit-processor = { workspace = true }
+payya-transformer = { workspace = true }
+payya-kv-cache = { workspace = true }
+payya-prompt-cache = { workspace = true }
+payya-quantization = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+tower = { workspace = true }

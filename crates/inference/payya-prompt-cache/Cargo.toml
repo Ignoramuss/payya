@@ -1,6 +1,6 @@
 [package]
 name = "payya-prompt-cache"
-description = "Prompt caching mechanism"
+description = "Radix-tree prefix matching for KV cache reuse across requests"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
