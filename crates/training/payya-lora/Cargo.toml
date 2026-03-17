@@ -7,3 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+payya-autograd = { workspace = true }
+payya-transformer = { workspace = true }
+payya-logit-processor = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

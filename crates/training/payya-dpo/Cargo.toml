@@ -7,3 +7,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+payya-transformer = { workspace = true }
+rand = { workspace = true }

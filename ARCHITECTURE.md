@@ -1389,6 +1389,213 @@ endpoint. Supports both non-streaming JSON responses and SSE streaming.
 
 ---
 
+### M7: `payya-lora` — Low-Rank Adaptation (LoRA)
+
+Freezes base model weights and injects trainable low-rank adapter matrices
+(B, A) into specified projection layers. For a frozen weight W of shape
+(d_in, d_out), the adapter computes: output = x @ W + (alpha/r) * x @ B @ A.
+
+```
+   Base Model (frozen)          LoRA Adapters (trainable)
+  ┌─────────────────┐         ┌──────────────────────────┐
+  │  token_emb      │         │  Per-layer adapters:      │
+  │  layers[i]:     │         │  ┌───────────────────┐    │
+  │    wq,wk,wv,wo  │◄───────│  │ wq: B(d,r) A(r,d) │    │
+  │    w1, w2       │         │  │ wv: B(d,r) A(r,d) │    │
+  │  output_weight  │         │  │ (others optional)  │    │
+  └─────────────────┘         │  └───────────────────┘    │
+                              └──────────────────────────┘
+
+  Forward pass for one projection:
+  ┌────────┐    ┌──────────────┐     ┌──────────────────────────┐
+  │  x     │───►│  x @ W       │────►│ x @ W + scale * x @ B @ A│──► output
+  │(seq,d) │    │  (frozen)    │     │       (combined)          │
+  │        │───►│  x @ B @ A   │────►│                           │
+  └────────┘    │  (trainable) │     └──────────────────────────┘
+                └──────────────┘
+     scale = alpha / rank
+
+  Merge (inference optimization):
+     W_merged = W + (alpha/rank) * B @ A
+     After merge, no adapter overhead at inference time.
+```
+
+**Key invariants:**
+- A initialized to zeros → initial LoRA output matches base model exactly.
+- B initialized with Kaiming uniform (fan_in = d_in).
+- Trainable params << total params (typically ~1%).
+- Merge produces numerically identical output to the adapted model.
+- Checkpoint stores only adapter weights, not base model.
+
+---
+
+### M7: `payya-dpo` — Direct Preference Optimization
+
+Implements the DPO loss from Rafailov et al. (2023). Optimizes a policy
+model to prefer chosen responses over rejected ones, using a frozen
+reference model to prevent distribution collapse.
+
+```
+  Preference pair:
+    prompt = [p0, p1, ...]
+    chosen = [c0, c1, ...]
+    rejected = [r0, r1, ...]
+
+  ┌─────────────┐         ┌─────────────┐
+  │ Policy (pi)  │         │ Reference    │
+  │ (trainable)  │         │ (frozen)     │
+  └──────┬───────┘         └──────┬───────┘
+         │                        │
+    log_pi(chosen)          log_ref(chosen)
+    log_pi(rejected)        log_ref(rejected)
+         │                        │
+         ▼                        ▼
+  ┌──────────────────────────────────────────┐
+  │ chosen_reward = log_pi(c) - log_ref(c)   │
+  │ rejected_reward = log_pi(r) - log_ref(r) │
+  │                                          │
+  │ L = -log(σ(β * (chosen_rw - rejected_rw)))│
+  └──────────────────────────────────────────┘
+
+  σ(x) = sigmoid(x)
+  β controls deviation from reference (higher = more conservative)
+```
+
+**Key invariants:**
+- When policy == reference, loss = log(2) (no preference signal).
+- Log-probabilities computed with numerically stable log-softmax.
+- Gradient estimation via finite differences (central difference, eps=1e-4).
+- beta must be positive.
+
+---
+
+### M7: `payya-distillation` — Knowledge Distillation
+
+Teacher-student training where the student learns to match the teacher's
+soft output distribution (KL divergence) while also fitting hard targets
+(cross-entropy).
+
+```
+  ┌──────────────┐    ┌──────────────┐
+  │ Teacher       │    │ Student       │
+  │ (frozen)      │    │ (trainable)   │
+  └──────┬────────┘    └──────┬────────┘
+         │                     │
+  logits_T / temp       logits_S / temp
+         │                     │
+    softmax(T)            softmax(S)
+         │                     │
+         ▼                     ▼
+  ┌──────────────────────────────────┐
+  │  KL(teacher_soft || student_soft) │
+  └──────────────┬───────────────────┘
+                 │
+  Combined loss: │
+  L = α * KL * T² + (1-α) * CE(student, hard_targets)
+       ▲              ▲
+       │              │
+  distillation    standard training
+  (soft targets)  (hard targets)
+```
+
+**Key invariants:**
+- Temperature T > 0 (higher → softer distributions).
+- KL(P || P) = 0 when teacher == student.
+- T² scaling compensates for gradient magnitude reduction from temperature.
+- CE loss computed via autograd; KL gradient via finite differences.
+- alpha=1.0: pure distillation. alpha=0.0: pure CE training.
+
+---
+
+### M7: `payya-rlhf` — PPO-Based RLHF
+
+Full Reinforcement Learning from Human Feedback pipeline: reward model
+training, value estimation, rollout generation, and PPO policy updates.
+
+```
+  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+  │ Policy Model  │   │ Reward Model  │   │ Value Model   │
+  │ (trainable)   │   │ (learned)     │   │ (learned)     │
+  └──────┬────────┘   └──────┬────────┘   └──────┬────────┘
+         │                    │                    │
+  1. Generate response  2. Score full seq   3. Estimate per-
+     autoregressively      → scalar reward      token values
+         │                    │                    │
+         ▼                    ▼                    ▼
+  ┌──────────────────────────────────────────────────────┐
+  │                    Rollout                            │
+  │  tokens, old_log_probs, reward, values, advantages    │
+  └──────────────────────────┬───────────────────────────┘
+                             │
+                        GAE computation:
+                        δ_t = r_t + γ·V(t+1) - V(t)
+                        A_t = Σ (γλ)^l · δ_{t+l}
+                             │
+                             ▼
+  ┌──────────────────────────────────────────────────────┐
+  │                   PPO Update                          │
+  │  ratio = exp(log_pi_new - log_pi_old)                 │
+  │  L_clip = -min(ratio·A, clip(ratio,1±ε)·A)           │
+  │  L_kl = kl_coeff · (log_pi_new - log_pi_ref)         │
+  │  L = L_clip + L_kl                                   │
+  └──────────────────────────────────────────────────────┘
+
+  Reward Model training (Bradley-Terry):
+    L_rm = -log(σ(r_chosen - r_rejected))
+    Uses last-token hidden state → linear head → scalar reward.
+```
+
+**Key invariants:**
+- Reward model learns to assign higher score to preferred responses.
+- Reference model (frozen clone of initial policy) prevents distribution collapse.
+- GAE with gamma=1.0, lambda=0.95 for advantage estimation.
+- PPO clip_eps=0.2 bounds the policy update magnitude.
+- KL penalty coefficient controls exploration vs. stability.
+
+---
+
+### M7: `payya-peft` — Parameter Efficient Fine-Tuning Orchestration
+
+Unified interface over multiple PEFT methods: LoRA and Prefix Tuning.
+Provides training utilities (warmup, clipping) and a common API.
+
+```
+  ┌──────────────────────────────────────────┐
+  │              PeftModel (enum)             │
+  │  ┌──────────────┐  ┌──────────────────┐  │
+  │  │ LoRA          │  │ Prefix Tuning     │  │
+  │  │               │  │                   │  │
+  │  │ Adapters:     │  │ Learnable prefix  │  │
+  │  │ B(d,r)·A(r,d) │  │ tokens prepended  │  │
+  │  │ per target    │  │ to input sequence │  │
+  │  │ per layer     │  │ per layer         │  │
+  │  └──────────────┘  └──────────────────┘  │
+  └──────────────────────────────────────────┘
+              │                   │
+         forward()           forward()
+         train_step()        train_step()
+              │                   │
+              ▼                   ▼
+  ┌──────────────────────────────────────────┐
+  │         PeftTrainConfig                   │
+  │  lr, warmup_steps, max_grad_norm          │
+  │  lr_at_step(step) → warmup schedule       │
+  └──────────────────────────────────────────┘
+
+  Prefix Tuning forward:
+    [prefix_emb; token_emb] → transformer layers → logits
+    (prefix positions stripped from output)
+```
+
+**Key invariants:**
+- All PEFT methods share the same forward()/train_step() interface.
+- Base model weights are frozen (registered as constants, not params).
+- Only adapter/prefix parameters receive gradients.
+- Linear LR warmup: lr = base_lr * (step+1) / warmup_steps during warmup.
+- Prefix tokens consume max_seq_len budget (prefix_len + seq <= max_seq_len).
+
+---
+
 ## Suggested Implementation Order
 
 Work bottom-up through the layers for the smoothest experience:

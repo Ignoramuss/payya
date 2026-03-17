@@ -516,6 +516,11 @@ version = "0.1.0"
 [[package]]
 name = "payya-distillation"
 version = "0.1.0"
+dependencies = [
+ "payya-autograd",
+ "payya-transformer",
+ "rand",
+]
 
 [[package]]
 name = "payya-distributed"
@@ -524,6 +529,10 @@ version = "0.1.0"
 [[package]]
 name = "payya-dpo"
 version = "0.1.0"
+dependencies = [
+ "payya-transformer",
+ "rand",
+]
 
 [[package]]
 name = "payya-embedding"
@@ -590,6 +599,14 @@ dependencies = [
 [[package]]
 name = "payya-lora"
 version = "0.1.0"
+dependencies = [
+ "payya-autograd",
+ "payya-logit-processor",
+ "payya-transformer",
+ "rand",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "payya-matmul"
@@ -613,6 +630,14 @@ version = "0.1.0"
 [[package]]
 name = "payya-peft"
 version = "0.1.0"
+dependencies = [
+ "payya-autograd",
+ "payya-lora",
+ "payya-transformer",
+ "rand",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "payya-prompt-cache"
@@ -637,6 +662,11 @@ version = "0.1.0"
 [[package]]
 name = "payya-rlhf"
 version = "0.1.0"
+dependencies = [
+ "payya-logit-processor",
+ "payya-transformer",
+ "rand",
+]
 
 [[package]]
 name = "payya-semantic-router"
